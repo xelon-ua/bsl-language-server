@@ -658,6 +658,26 @@
             "title": "Empty statement",
             "$id": "#/definitions/EmptyStatement"
         },
+        "EventHandlerInvalidSignature": {
+            "description": "Event handler signature mismatch",
+            "default": true,
+            "type": [
+                "boolean",
+                "object"
+            ],
+            "title": "Event handler signature mismatch",
+            "$id": "#/definitions/EventHandlerInvalidSignature"
+        },
+        "EventHandlerOutsideEventRegion": {
+            "description": "Event handler outside standard region",
+            "default": true,
+            "type": [
+                "boolean",
+                "object"
+            ],
+            "title": "Event handler outside standard region",
+            "$id": "#/definitions/EventHandlerOutsideEventRegion"
+        },
         "ExcessiveAutoTestCheck": {
             "description": "Excessive AutoTest Check",
             "default": true,
@@ -2037,6 +2057,24 @@
                 }
             },
             "$id": "#/definitions/Typo"
+        },
+        "UkrainianLetterUsage": {
+            "description": "Using Ukrainian letters in code",
+            "default": false,
+            "type": [
+                "boolean",
+                "object"
+            ],
+            "title": "Using Ukrainian letters in code",
+            "properties": {
+                "letters": {
+                    "description": "Regular expression with the set of prohibited (Ukrainian) letters",
+                    "default": "[\u0456\u0457\u0454\u0491]",
+                    "type": "string",
+                    "title": "Regular expression with the set of prohibited (Ukrainian) letters"
+                }
+            },
+            "$id": "#/definitions/UkrainianLetterUsage"
         },
         "UnaryPlusInConcatenation": {
             "description": "Unary Plus sign in string concatenation",
