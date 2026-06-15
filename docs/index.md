@@ -212,6 +212,10 @@ Usage: bsl-language-server analyze [-hq] [-c=<path>] [-o=<path>] [-s=<path>]
 Run analysis and get diagnostic info
   -c, --configuration=<path>
                            Path to language server configuration file
+  -fl, --file-list=<path>  Path to a text file with the list of files to run
+                           diagnostics on (one path per line; relative paths are
+                           resolved against workspaceDir). Cross-file analysis
+                           still scans the whole project.
   -h, --help               Show this help message and exit
   -o, --outputDir=<path>   Output report directory
   -q, --silent             Silent mode
@@ -222,6 +226,9 @@ Run analysis and get diagnostic info
 ```
 
 Для указания каталога расположения анализируемых исходников используется параметр `--srcDir` (сокращенно `-s`), за которым следует путь (относительный или абсолютный) к каталогу исходников. 
+
+Для запуска диагностик только по части файлов используется параметр `--file-list` (сокращенно `-fl`), за которым следует путь к текстовому файлу со списком путей (по одному на строку; относительные пути резолвятся относительно `workspaceDir`). Сканирование исходников для кросс-файловых диагностик при этом выполняется по всему проекту, а сами диагностики рассчитываются только для перечисленных файлов. Удобно для анализа изменённых файлов в CI, например `git diff --name-only > files.txt`.
+
 Для формирования отчета об анализе требуется указать один из "репортеров". Для указания репортера используется параметр `--reporter` (сокращенно `-r`), за которым следует ключ репортера. Допустимо указывать несколько репортеров. Список репортетов см. в разделе **Репортеры**.
 
 Пример строки запуска анализа:

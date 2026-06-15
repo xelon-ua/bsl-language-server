@@ -212,6 +212,10 @@ Usage: bsl-language-server analyze [-hq] [-c=<path>] [-o=<path>] [-s=<path>]
 Run analysis and get diagnostic info
   -c, --configuration=<path>
                            Path to language server configuration file
+  -fl, --file-list=<path>  Path to a text file with the list of files to run
+                           diagnostics on (one path per line; relative paths are
+                           resolved against workspaceDir). Cross-file analysis
+                           still scans the whole project.
   -h, --help               Show this help message and exit
   -o, --outputDir=<path>   Output report directory
   -q, --silent             Silent mode
@@ -222,6 +226,9 @@ Run analysis and get diagnostic info
 ```
 
 To set source code folder for analysis use parameter `--srcDir` (short `-s`) followed by the path (relative or absolute) to the source code folder. 
+
+To run diagnostics only on a subset of files use parameter `--file-list` (short `-fl`) followed by the path to a text file with the list of paths (one per line; relative paths are resolved against `workspaceDir`). Source scanning for cross-file diagnostics still covers the whole project, while diagnostics are computed only for the listed files. Handy for analyzing changed files in CI, e.g. `git diff --name-only > files.txt`.
+
 To generate an analysis report you need to specify one or more reporters. To specify reporter use parameter `--reporter` or `-r`, followed by reporter key. You may specify several reporters. The list of reporters see in section  **Reporters**.
 
 Command line example to run analysis:

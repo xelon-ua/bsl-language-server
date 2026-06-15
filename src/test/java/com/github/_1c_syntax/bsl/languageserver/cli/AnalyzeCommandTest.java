@@ -21,6 +21,10 @@
  */
 package com.github._1c_syntax.bsl.languageserver.cli;
 
+import com.github._1c_syntax.bsl.languageserver.reporters.JsonReporter;
+import com.github._1c_syntax.bsl.languageserver.reporters.ReportersAggregator;
+import com.github._1c_syntax.bsl.languageserver.reporters.data.AnalysisInfo;
+import com.github._1c_syntax.bsl.languageserver.reporters.databind.AnalysisInfoJsonMapper;
 import com.github._1c_syntax.bsl.languageserver.util.CleanupContextBeforeClassAndAfterEachTestMethod;
 import com.github._1c_syntax.bsl.languageserver.util.TestUtils;
 import org.junit.jupiter.api.Test;
@@ -29,9 +33,13 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.io.IOException;
 import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -45,6 +53,12 @@ class AnalyzeCommandTest {
   @Autowired
   private AnalyzeCommand analyzeCommand;
 
+  @Autowired
+  private ReportersAggregator reportersAggregator;
+
+  @Autowired
+  private JsonReporter jsonReporter;
+
   @TempDir
   Path tempDir;
 
@@ -56,6 +70,7 @@ class AnalyzeCommandTest {
     ReflectionTestUtils.setField(analyzeCommand, "workspaceDirOption", METADATA_PATH);
     ReflectionTestUtils.setField(analyzeCommand, "outputDirOption", tempDir.toString());
     ReflectionTestUtils.setField(analyzeCommand, "configurationOption", CONFIG_PATH);
+    ReflectionTestUtils.setField(analyzeCommand, "fileListOption", "");
     ReflectionTestUtils.setField(analyzeCommand, "silentMode", true);
 
     // when
@@ -75,6 +90,7 @@ class AnalyzeCommandTest {
     ReflectionTestUtils.setField(analyzeCommand, "workspaceDirOption", nonexistentWorkspace);
     ReflectionTestUtils.setField(analyzeCommand, "outputDirOption", tempDir.toString());
     ReflectionTestUtils.setField(analyzeCommand, "configurationOption", CONFIG_PATH);
+    ReflectionTestUtils.setField(analyzeCommand, "fileListOption", "");
     ReflectionTestUtils.setField(analyzeCommand, "silentMode", true);
 
     // when
@@ -94,6 +110,7 @@ class AnalyzeCommandTest {
     ReflectionTestUtils.setField(analyzeCommand, "workspaceDirOption", METADATA_PATH);
     ReflectionTestUtils.setField(analyzeCommand, "outputDirOption", tempDir.toString());
     ReflectionTestUtils.setField(analyzeCommand, "configurationOption", CONFIG_PATH);
+    ReflectionTestUtils.setField(analyzeCommand, "fileListOption", "");
     ReflectionTestUtils.setField(analyzeCommand, "silentMode", true);
 
     // when
@@ -111,6 +128,7 @@ class AnalyzeCommandTest {
     ReflectionTestUtils.setField(analyzeCommand, "workspaceDirOption", METADATA_PATH);
     ReflectionTestUtils.setField(analyzeCommand, "outputDirOption", tempDir.toString());
     ReflectionTestUtils.setField(analyzeCommand, "configurationOption", CONFIG_PATH);
+    ReflectionTestUtils.setField(analyzeCommand, "fileListOption", "");
     ReflectionTestUtils.setField(analyzeCommand, "silentMode", false);
 
     // when
@@ -118,6 +136,166 @@ class AnalyzeCommandTest {
 
     // then
     assertThat(exitCode).isZero();
+  }
+
+  /** С валидным --file-list, содержащим один существующий файл, анализ завершается успешно. */
+  @Test
+  void callWithFileListRunsSuccessfully() throws java.io.IOException {
+    // given
+    var objectModule = Path.of(METADATA_PATH,
+      "Catalogs", "Справочник1", "Ext", "ObjectModule.bsl").toAbsolutePath();
+    var fileList = tempDir.resolve("files.txt");
+    java.nio.file.Files.writeString(fileList, objectModule + System.lineSeparator(),
+      java.nio.charset.StandardCharsets.UTF_8);
+
+    ReflectionTestUtils.setField(analyzeCommand, "srcDirOption", METADATA_PATH);
+    ReflectionTestUtils.setField(analyzeCommand, "workspaceDirOption", METADATA_PATH);
+    ReflectionTestUtils.setField(analyzeCommand, "outputDirOption", tempDir.toString());
+    ReflectionTestUtils.setField(analyzeCommand, "configurationOption", CONFIG_PATH);
+    ReflectionTestUtils.setField(analyzeCommand, "fileListOption", fileList.toString());
+    ReflectionTestUtils.setField(analyzeCommand, "silentMode", true);
+
+    // when
+    var exitCode = analyzeCommand.call();
+
+    // then
+    assertThat(exitCode).isZero();
+  }
+
+  /** Несуществующий файл-список --file-list — команда возвращает код 1 (ошибка). */
+  @Test
+  void callReturnsOneWhenFileListDoesNotExist() {
+    // given
+    var nonexistentFileList = tempDir.resolve("nonexistent_list.txt").toAbsolutePath().toString();
+
+    ReflectionTestUtils.setField(analyzeCommand, "srcDirOption", METADATA_PATH);
+    ReflectionTestUtils.setField(analyzeCommand, "workspaceDirOption", METADATA_PATH);
+    ReflectionTestUtils.setField(analyzeCommand, "outputDirOption", tempDir.toString());
+    ReflectionTestUtils.setField(analyzeCommand, "configurationOption", CONFIG_PATH);
+    ReflectionTestUtils.setField(analyzeCommand, "fileListOption", nonexistentFileList);
+    ReflectionTestUtils.setField(analyzeCommand, "silentMode", true);
+
+    // when
+    var exitCode = analyzeCommand.call();
+
+    // then
+    assertThat(exitCode).isOne();
+  }
+
+  /** filterByFileList оставляет только перечисленные файлы; непустой список с одним файлом даёт один файл. */
+  @Test
+  void filterByFileListReturnsOnlyListedFiles() throws java.io.IOException {
+    // given
+    var objectModule = Path.of(METADATA_PATH,
+      "Catalogs", "Справочник1", "Ext", "ObjectModule.bsl").toAbsolutePath();
+    var managerModule = Path.of(METADATA_PATH,
+      "Catalogs", "Справочник1", "Ext", "ManagerModule.bsl").toAbsolutePath();
+
+    var fileList = tempDir.resolve("files.txt");
+    // одна валидная запись (objectModule) + одна несовпадающая (warning + skip)
+    java.nio.file.Files.writeString(
+      fileList,
+      objectModule + System.lineSeparator() + "does/not/exist.bsl" + System.lineSeparator(),
+      java.nio.charset.StandardCharsets.UTF_8
+    );
+
+    var workspaceDir = Path.of(METADATA_PATH).toAbsolutePath();
+    var allFiles = new java.util.ArrayList<java.io.File>(
+      java.util.List.of(objectModule.toFile(), managerModule.toFile()));
+
+    ReflectionTestUtils.setField(analyzeCommand, "fileListOption", fileList.toString());
+
+    // when
+    @SuppressWarnings("unchecked")
+    var filtered = (java.util.List<java.io.File>) ReflectionTestUtils.invokeMethod(
+      analyzeCommand, "filterByFileList", allFiles, workspaceDir);
+
+    // then
+    assertThat(filtered).containsExactly(objectModule.toFile());
+  }
+
+  /** Без --file-list filterByFileList возвращает исходный список без изменений. */
+  @Test
+  void filterByFileListReturnsAllFilesWhenOptionBlank() {
+    // given
+    var objectModule = Path.of(METADATA_PATH,
+      "Catalogs", "Справочник1", "Ext", "ObjectModule.bsl").toAbsolutePath();
+    var workspaceDir = Path.of(METADATA_PATH).toAbsolutePath();
+    var allFiles = new java.util.ArrayList<java.io.File>(
+      java.util.List.of(objectModule.toFile()));
+
+    ReflectionTestUtils.setField(analyzeCommand, "fileListOption", "");
+
+    // when
+    @SuppressWarnings("unchecked")
+    var filtered = (java.util.List<java.io.File>) ReflectionTestUtils.invokeMethod(
+      analyzeCommand, "filterByFileList", allFiles, workspaceDir);
+
+    // then
+    assertThat(filtered).isSameAs(allFiles);
+  }
+
+  /**
+   * End-to-end: {@code --file-list} реально сокращает набор анализируемых файлов.
+   * <p>
+   * Запускает два полных прохода через {@code call()} с JSON-репортером:
+   * <ol>
+   *   <li>без {@code --file-list} — ожидаем, что в отчёте окажутся ВСЕ файлы проекта;</li>
+   *   <li>с {@code --file-list}, содержащим один файл — ожидаем ровно одну запись в отчёте.</li>
+   * </ol>
+   * Тест поймает регрессию, при которой diagnostic-цикл будет снова направлен на полный
+   * список {@code files} вместо отфильтрованного {@code filesToAnalyze}.
+   */
+  @Test
+  void fileListLimitsAnalyzedFilesEndToEnd() throws IOException {
+    // Подменяем filteredReporters напрямую, чтобы не зависеть от @Lazy-инициализации бина,
+    // которая могла произойти раньше (в другом тест-методе) с пустым reportersOptions.
+    ReflectionTestUtils.setField(reportersAggregator, "filteredReporters", List.of(jsonReporter));
+
+    var mapper = new AnalysisInfoJsonMapper();
+
+    // --- Прогон 1: без --file-list, анализируем весь проект ---
+    var outFull = Files.createDirectory(tempDir.resolve("out-full"));
+
+    ReflectionTestUtils.setField(analyzeCommand, "srcDirOption", METADATA_PATH);
+    ReflectionTestUtils.setField(analyzeCommand, "workspaceDirOption", METADATA_PATH);
+    ReflectionTestUtils.setField(analyzeCommand, "outputDirOption", outFull.toString());
+    ReflectionTestUtils.setField(analyzeCommand, "configurationOption", CONFIG_PATH);
+    ReflectionTestUtils.setField(analyzeCommand, "fileListOption", "");
+    ReflectionTestUtils.setField(analyzeCommand, "silentMode", true);
+
+    assertThat(analyzeCommand.call()).isZero();
+
+    var fullReport = mapper.readValue(outFull.resolve("bsl-json.json").toFile(), AnalysisInfo.class);
+    var fullCount = fullReport.fileinfos().size();
+
+    // --- Прогон 2: с --file-list, содержащим один файл ---
+    var objectModule = Path.of(METADATA_PATH,
+      "Catalogs", "Справочник1", "Ext", "ObjectModule.bsl").toAbsolutePath();
+    var fileList = tempDir.resolve("files.txt");
+    Files.writeString(fileList, objectModule + System.lineSeparator(), StandardCharsets.UTF_8);
+
+    var outFiltered = Files.createDirectory(tempDir.resolve("out-filtered"));
+
+    ReflectionTestUtils.setField(analyzeCommand, "srcDirOption", METADATA_PATH);
+    ReflectionTestUtils.setField(analyzeCommand, "workspaceDirOption", METADATA_PATH);
+    ReflectionTestUtils.setField(analyzeCommand, "outputDirOption", outFiltered.toString());
+    ReflectionTestUtils.setField(analyzeCommand, "configurationOption", CONFIG_PATH);
+    ReflectionTestUtils.setField(analyzeCommand, "fileListOption", fileList.toString());
+    ReflectionTestUtils.setField(analyzeCommand, "silentMode", true);
+
+    assertThat(analyzeCommand.call()).isZero();
+
+    var filteredReport = mapper.readValue(outFiltered.resolve("bsl-json.json").toFile(), AnalysisInfo.class);
+    var filteredCount = filteredReport.fileinfos().size();
+
+    // --- Проверки ---
+    assertThat(filteredCount)
+      .as("--file-list с одним файлом должен дать ровно одну запись в отчёте")
+      .isEqualTo(1);
+    assertThat(fullCount)
+      .as("Полный прогон должен проанализировать больше файлов, чем отфильтрованный")
+      .isGreaterThan(filteredCount);
   }
 
   /** Возвращает абсолютный путь к тестовому конфигу с {@code excludePaths}. */

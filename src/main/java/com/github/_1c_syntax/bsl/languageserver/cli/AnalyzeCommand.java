@@ -48,6 +48,7 @@ import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.stream.Collectors;
 
 import static picocli.CommandLine.Option;
 
@@ -121,6 +122,15 @@ public class AnalyzeCommand implements Callable<Integer> {
   private String outputDirOption;
 
   @Option(
+    names = {"-fl", "--file-list"},
+    description = "Path to a text file with the list of files to run diagnostics on "
+      + "(one path per line; relative paths are resolved against workspaceDir). "
+      + "Cross-file analysis still scans the whole project.",
+    paramLabel = "<path>",
+    defaultValue = "")
+  private String fileListOption = "";
+
+  @Option(
     names = {"-c", "--configuration"},
     description = "Path to language server configuration file",
     paramLabel = "<path>",
@@ -162,6 +172,14 @@ public class AnalyzeCommand implements Callable<Integer> {
       return 1;
     }
 
+    if (!fileListOption.isBlank()) {
+      var fileListFile = Absolute.path(fileListOption);
+      if (!fileListFile.toFile().exists()) {
+        LOGGER.error("File list `{}` is not exists", fileListFile);
+        return 1;
+      }
+    }
+
     var configurationFile = new File(configurationOption);
 
     // Update global configuration
@@ -182,21 +200,23 @@ public class AnalyzeCommand implements Callable<Integer> {
 
       serverContext.populateContext(files);
 
+      var filesToAnalyze = filterByFileList(files, workspaceDir);
+
       List<FileInfo> fileInfos;
       if (silentMode) {
         fileInfos = cliExecutor.submit(() ->
-          files.parallelStream()
+          filesToAnalyze.parallelStream()
             .map((File file) -> getFileInfoFromFile(workspaceDir, file))
             .toList()
         ).get();
       } else {
         try (ProgressBar pb = new ProgressBarBuilder()
           .setTaskName("Analyzing files...")
-          .setInitialMax(files.size())
+          .setInitialMax(filesToAnalyze.size())
           .setStyle(ProgressBarStyle.ASCII)
           .build()) {
           fileInfos = cliExecutor.submit(() ->
-            files.parallelStream()
+            filesToAnalyze.parallelStream()
               .map((File file) -> {
                 pb.step();
                 return getFileInfoFromFile(workspaceDir, file);
@@ -216,6 +236,42 @@ public class AnalyzeCommand implements Callable<Integer> {
       Thread.currentThread().interrupt();
       throw new IllegalStateException("Interrupted while analyzing files", e);
     }
+  }
+
+  /**
+   * Возвращает подмножество {@code allFiles}, попадающее в список из {@code --file-list}.
+   * <p>
+   * Если опция не задана — возвращает {@code allFiles} без изменений. Записи списка, не совпавшие
+   * ни с одним файлом проекта (исключены excludePaths, не существуют, вне srcDir), логируются как
+   * предупреждение и пропускаются. Полное сканирование проекта (populateContext) при этом не
+   * затрагивается, поэтому кросс-файловый индекс остаётся построенным по всем файлам.
+   *
+   * @param allFiles     все найденные файлы проекта
+   * @param workspaceDir каталог для резолва относительных путей из списка
+   * @return файлы для расчёта диагностик
+   */
+  List<File> filterByFileList(List<File> allFiles, Path workspaceDir) {
+    if (fileListOption.isBlank()) {
+      return allFiles;
+    }
+
+    var fileListFile = Absolute.path(fileListOption);
+    var requestedUris = FileListReader.read(fileListFile, workspaceDir);
+
+    var matched = allFiles.stream()
+      .filter(file -> requestedUris.contains(Absolute.uri(file)))
+      .toList();
+
+    var matchedUris = matched.stream().map(Absolute::uri).collect(Collectors.toSet());
+    requestedUris.stream()
+      .filter(uri -> !matchedUris.contains(uri))
+      .forEach(uri -> LOGGER.warn("File from --file-list not found among analyzed files: {}", uri));
+
+    if (matched.isEmpty()) {
+      LOGGER.warn("No files from --file-list matched project files. Report will be empty.");
+    }
+
+    return matched;
   }
 
   public String[] getReportersOptions() {
