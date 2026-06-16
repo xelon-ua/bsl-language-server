@@ -77,6 +77,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Predicate;
 
@@ -609,7 +610,7 @@ public class ExpressionTypeInferencer {
     for (var ref : leftTypes.refs()) {
       var fields = leftTypes.getLocalFields(ref);
       for (var entry : fields.entrySet()) {
-        merged.merge(entry.getKey(), entry.getValue(), TypeSet::union);
+        merged.merge(entry.getKey(), entry.getValue().types(), TypeSet::union);
       }
     }
     return merged;
@@ -643,7 +644,7 @@ public class ExpressionTypeInferencer {
         var fields = leftTypes.getLocalFields(leftType);
         for (var entry : fields.entrySet()) {
           if (entry.getKey().equalsIgnoreCase(memberName)) {
-            fromLocalFields = fromLocalFields.union(entry.getValue());
+            fromLocalFields = fromLocalFields.union(entry.getValue().types());
           }
         }
       }
@@ -664,6 +665,21 @@ public class ExpressionTypeInferencer {
         }
         if (!member.matches(memberName)) {
           continue;
+        }
+        // Для метода проектного модуля (в т.ч. вызванного межмодульно как
+        // ОбщийМодуль.Метод()) берём полный тип возврата из индекса символов —
+        // с localFields структуры/ТЗ, объявленными в JsDoc. MemberDescriptor
+        // несёт лишь головной ref, поэтому без этого поля структуры терялись.
+        if (expectedKind == MemberKind.METHOD) {
+          var declaredReturn = member.getSourceSymbol()
+            .filter(MethodSymbol.class::isInstance)
+            .map(MethodSymbol.class::cast)
+            .map(symbolTypeIndex::getDeclaredReturnTypes)
+            .filter(declared -> !declared.isEmpty());
+          if (declaredReturn.isPresent()) {
+            result = result.union(declaredReturn.get());
+            continue;
+          }
         }
         // Возможные типы члена (union); UNKNOWN-ref'ы отбрасываем.
         for (var ref : member.returnTypes().refs()) {
@@ -689,7 +705,8 @@ public class ExpressionTypeInferencer {
     }
     var enriched = TypeSet.of(ret);
     for (var entry : elementSet.getLocalFields(ret).entrySet()) {
-      enriched = enriched.withField(ret, entry.getKey(), entry.getValue());
+      var field = entry.getValue();
+      enriched = enriched.withField(ret, entry.getKey(), field.types(), field.description());
     }
     return enriched;
   }
@@ -920,7 +937,9 @@ public class ExpressionTypeInferencer {
     if (params == null) {
       return null;
     }
-    var keyName = extractStringLiteralText(params.get(0).expression());
+    var keyName = Optional.ofNullable(params.get(0).expression())
+      .map(ExpressionTypeInferencer::extractStringLiteralText)
+      .orElse(null);
     if (keyName == null || keyName.isBlank()) {
       return null;
     }
@@ -1010,7 +1029,9 @@ public class ExpressionTypeInferencer {
     if (params == null) {
       return null;
     }
-    var keyName = extractStringLiteralText(params.get(0).expression());
+    var keyName = Optional.ofNullable(params.get(0).expression())
+      .map(ExpressionTypeInferencer::extractStringLiteralText)
+      .orElse(null);
     if (keyName == null || keyName.isBlank()) {
       return null;
     }
@@ -1018,7 +1039,8 @@ public class ExpressionTypeInferencer {
     // через инференсер; если в нём есть ОписаниеТипов-ref, забираем его elementTypes
     // (туда applyTypeDescriptionConstructorTypes складывает имена типов из первого аргумента
     // конструктора). Любое другое выражение даст пустой набор — колонка останется Неопределено.
-    var columnTypes = params.size() >= 2 ? extractColumnTypes(params.get(1).expression(), ctx) : TypeSet.EMPTY;
+    var valueExpr = params.size() >= 2 ? params.get(1).expression() : null;
+    var columnTypes = valueExpr == null ? TypeSet.EMPTY : extractColumnTypes(valueExpr, ctx);
     return new KeyedTypes(keyName.trim(), columnTypes.isEmpty() ? TypeSet.of(UNDEFINED) : columnTypes);
   }
 
