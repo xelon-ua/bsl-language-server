@@ -160,7 +160,7 @@ public class BslContextPlatformTypesProvider implements PlatformTypesProvider {
     var typeParameters = context.typeParameters();
     var isEnum = context instanceof ContextEnum;
     return new TypeDecl(kind, name, members,
-      isExposedAsGlobal(context), description, constructors,
+      description, constructors,
       defaultElementTypes, supportsForEach, supportsIndexAccess,
       forEachDescription, indexAccessDescription, typeParameters, isEnum);
   }
@@ -230,18 +230,6 @@ public class BslContextPlatformTypesProvider implements PlatformTypesProvider {
    * {@code Справочники} ↔ {@code СправочникиМенеджер} идёт через
    * {@link GlobalScopeProvider} из свойств глобального контекста.
    */
-  private static boolean isExposedAsGlobal(Context context) {
-    if (!(context instanceof ContextType type)) {
-      return false;
-    }
-    for (var p : type.properties()) {
-      if (p.isGeneric()) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   @Nullable
   private static TypeKind mapKind(Context context) {
     return switch (context.kind()) {
@@ -302,7 +290,8 @@ public class BslContextPlatformTypesProvider implements PlatformTypesProvider {
     return descriptor.withMetadata(metadataOf(property))
       .withBilingualName(bilingualName(property.name()))
       .withBilingualDescription(BilingualString.of(
-        safe(property.description()), safe(enLookup.apply(property).description())));
+        safe(property.description()), safe(enLookup.apply(property).description())))
+      .withStandardLibrary(true);
   }
 
   private static String safe(@Nullable String s) {
@@ -329,7 +318,7 @@ public class BslContextPlatformTypesProvider implements PlatformTypesProvider {
       false,
       metadataOf(method, enLookup),
       method.isAsync()
-    );
+    ).withStandardLibrary(true);
   }
 
   /** Преобразует {@link ContextName} в {@link BilingualString}. */
@@ -362,7 +351,7 @@ public class BslContextPlatformTypesProvider implements PlatformTypesProvider {
       event.isGeneric(),
       metadataOf(event),
       false
-    );
+    ).withStandardLibrary(true);
   }
 
 
@@ -378,7 +367,8 @@ public class BslContextPlatformTypesProvider implements PlatformTypesProvider {
     return descriptor.withMetadata(metadataOf(value))
       .withBilingualName(bilingualName(value.name()))
       .withBilingualDescription(BilingualString.of(
-        safe(value.description()), safe(enLookup.apply(value).description())));
+        safe(value.description()), safe(enLookup.apply(value).description())))
+      .withStandardLibrary(true);
   }
 
   /**

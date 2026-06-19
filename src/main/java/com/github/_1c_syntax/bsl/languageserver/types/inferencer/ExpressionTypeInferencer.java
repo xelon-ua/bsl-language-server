@@ -48,9 +48,8 @@ import com.github._1c_syntax.bsl.languageserver.types.oscript.extends_.ExtendsAn
 import com.github._1c_syntax.bsl.languageserver.types.oscript.extends_.OScriptExtends;
 import com.github._1c_syntax.bsl.languageserver.types.registry.GlobalScopeProvider;
 import com.github._1c_syntax.bsl.languageserver.types.registry.TypeRegistry;
-import com.github._1c_syntax.bsl.languageserver.types.scope.GlobalSymbolScope;
-import com.github._1c_syntax.bsl.languageserver.types.symbol.SyntheticSymbol;
 import com.github._1c_syntax.bsl.languageserver.utils.Ranges;
+import com.github._1c_syntax.bsl.languageserver.utils.DescriptionTypes;
 import com.github._1c_syntax.bsl.languageserver.utils.Trees;
 import com.github._1c_syntax.bsl.languageserver.utils.expressiontree.BinaryOperationNode;
 import com.github._1c_syntax.bsl.languageserver.utils.expressiontree.BslExpression;
@@ -62,6 +61,7 @@ import com.github._1c_syntax.bsl.languageserver.utils.expressiontree.TernaryOper
 import com.github._1c_syntax.bsl.languageserver.utils.expressiontree.UnaryOperationNode;
 import com.github._1c_syntax.bsl.parser.BSLParser;
 import com.github._1c_syntax.bsl.parser.description.TypeDescription;
+import com.github._1c_syntax.bsl.parser.description.VariableDescription;
 import lombok.RequiredArgsConstructor;
 import org.antlr.v4.runtime.tree.ParseTree;
 import org.antlr.v4.runtime.tree.TerminalNode;
@@ -71,6 +71,7 @@ import org.jspecify.annotations.Nullable;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -250,24 +251,14 @@ public class ExpressionTypeInferencer {
         return parent;
       }
     }
-    // Глобальная область: платформенные глобалы, library-модули,
-    // common-модули — все приходят через единый GlobalSymbolScope.
-    // ВАЖНО: имена классов (роль TYPE_NAME — например, голое `Структура`)
-    // здесь пропускаются: имя класса само по себе не является инстансом
-    // класса, и `Структура.` не должен показывать методы класса.
-    var fromScope = globalScopeProvider.findGlobalEntry(text, ctx.documentContext.getFileType())
-      .filter(entry -> entry.role() != GlobalSymbolScope.Role.TYPE_NAME)
-      .map(entry -> {
-        var symbol = entry.symbol();
-        if (symbol instanceof SyntheticSymbol s) {
-          return s.getValueType();
-        }
-        return TypeRef.UNKNOWN;
-      })
-      .filter(ref -> !ref.equals(TypeRef.UNKNOWN))
-      .map(TypeSet::of)
+    // Глобальная область: платформенные глобалы, library-модули, common-модули —
+    // все приходят как глобальные свойства.
+    // Только PROPERTY: голое имя глобальной функции (METHOD) — не значение, а
+    // имена типов для `Новый` (Структура) вообще не члены контекста.
+    return globalScopeProvider.globalProperty(text, ctx.documentContext.getFileType())
+      .map(MemberDescriptor::returnTypes)
+      .filter(types -> types.refs().stream().anyMatch(ref -> !ref.equals(TypeRef.UNKNOWN)))
       .orElse(TypeSet.EMPTY);
-    return fromScope;
   }
 
   // ---------------------------------------------------------------------------
@@ -484,21 +475,8 @@ public class ExpressionTypeInferencer {
     if (sourceDefinedReturn.isPresent() && !sourceDefinedReturn.get().isEmpty()) {
       return sourceDefinedReturn.get();
     }
-    // 2. Платформенная глобальная функция (СтрНайти, ПолучитьСообщенияПользователю
-    //    и т.п.) опубликована как SyntheticSymbol с kind=PLATFORM_GLOBAL_METHOD.
-    //    Его valueType — это returnType метода: пробрасываем как тип переменной.
-    var syntheticReturn = reference
-      .map(Reference::symbol)
-      .filter(SyntheticSymbol.class::isInstance)
-      .map(SyntheticSymbol.class::cast)
-      .map(SyntheticSymbol::getValueType)
-      .filter(ref -> ref != null && !ref.equals(TypeRef.UNKNOWN))
-      .map(TypeSet::of);
-    if (syntheticReturn.isPresent()) {
-      return syntheticReturn.get();
-    }
-    // 3. Fallback: глобальная функция через GlobalScopeProvider (полный
-    //    MemberDescriptor с TypeSet, включая union).
+    // 2. Платформенная глобальная функция (СтрНайти и т.п.) — через
+    //    GlobalScopeProvider (полный MemberDescriptor с TypeSet, включая union).
     return globalFunctionReturnTypes(name.getText(), ctx);
   }
 
@@ -511,8 +489,7 @@ public class ExpressionTypeInferencer {
     if (methodName == null || methodName.isBlank()) {
       return TypeSet.EMPTY;
     }
-    return globalScopeProvider
-      .findFunction(methodName, ctx.documentContext.getFileType())
+    return globalScopeProvider.globalFunction(methodName, ctx.documentContext.getFileType())
       .map(MemberDescriptor::returnTypes)
       .filter(types -> !types.isEmpty())
       .orElse(TypeSet.EMPTY);
@@ -1221,8 +1198,9 @@ public class ExpressionTypeInferencer {
 
   /**
    * Извлечь типы из висячего комментария декларации переменной:
-   * {@code Перем X; // Тип -}. Источник — {@code VariableDescription.trailingDescription},
-   * который парсер уже привязал к декларации.
+   * {@code Перем X; // Тип -}. Источник — структурно разобранные парсером типы
+   * {@code VariableDescription.trailingDescription.getTypes()}, который парсер уже
+   * привязал к декларации.
    */
   private TypeSet typesFromVariableTrailingComment(VariableSymbol variable) {
     var description = variable.getDescription().orElse(null);
@@ -1233,16 +1211,7 @@ public class ExpressionTypeInferencer {
     if (trailing == null) {
       return TypeSet.EMPTY;
     }
-    var names = InlineTypeCommentParser.parseTypeNames(trailing.getDescription());
-    if (names.isEmpty()) {
-      return TypeSet.EMPTY;
-    }
-    Set<TypeRef> refs = new LinkedHashSet<>();
-    var fileType = variable.getOwner().getFileType();
-    for (var name : names) {
-      typeRegistry.resolve(name, fileType).ifPresent(refs::add);
-    }
-    return refs.isEmpty() ? TypeSet.EMPTY : TypeSet.of(refs);
+    return resolveCommentTypes(trailing.getTypes(), variable.getOwner().getFileType());
   }
 
   /**
@@ -1429,19 +1398,45 @@ public class ExpressionTypeInferencer {
   /**
    * Подхватить типы из висячего комментария в строке присваивания:
    * {@code X = F(); // Тип -}. Соответствует «inline-typing локальной
-   * переменной» из стандарта 1С:EDT.
+   * переменной» из стандарта 1С:EDT. Комментарий разбирается тем же парсером
+   * описаний, что и висячий комментарий декларации: из токена строится
+   * {@link VariableDescription}, а типы берутся структурно из её
+   * {@code trailingDescription.getTypes()}.
    */
   private TypeSet inlineCommentTypes(
     DocumentContext owner,
     BSLParser.AssignmentContext assignment
   ) {
-    return Trees.getTrailingComment(owner.getTokens(), assignment.getStop()).map(commentToken -> {
-      Set<TypeRef> refs = new LinkedHashSet<>();
-      for (var name : InlineTypeCommentParser.parseTypeNames(commentToken.getText())) {
-        typeRegistry.resolve(name, owner.getFileType()).ifPresent(refs::add);
+    var trailingComment = Trees.getTrailingComment(owner.getTokens(), assignment.getStop());
+    if (trailingComment.isEmpty()) {
+      return TypeSet.EMPTY;
+    }
+    var trailing = VariableDescription.create(Collections.emptyList(), trailingComment)
+      .getTrailingDescription()
+      .orElse(null);
+    if (trailing == null) {
+      return TypeSet.EMPTY;
+    }
+    return resolveCommentTypes(trailing.getTypes(), owner.getFileType());
+  }
+
+  /**
+   * Резолвит структурно разобранные парсером типы комментария в {@link TypeSet}
+   * по их {@link TypeDescription#name()}. Для коллекционной нотации
+   * {@code Массив из Число} парсер возвращает один тип-голову {@code Массив}.
+   */
+  private TypeSet resolveCommentTypes(List<TypeDescription> types, FileType fileType) {
+    if (types == null || types.isEmpty()) {
+      return TypeSet.EMPTY;
+    }
+    Set<TypeRef> refs = new LinkedHashSet<>();
+    for (var td : types) {
+      var typeName = DescriptionTypes.resolveName(td);
+      if (!typeName.isBlank()) {
+        typeRegistry.resolve(typeName, fileType).ifPresent(refs::add);
       }
-      return refs.isEmpty() ? TypeSet.EMPTY : TypeSet.of(refs);
-    }).orElse(TypeSet.EMPTY);
+    }
+    return refs.isEmpty() ? TypeSet.EMPTY : TypeSet.of(refs);
   }
 
   // ---------------------------------------------------------------------------

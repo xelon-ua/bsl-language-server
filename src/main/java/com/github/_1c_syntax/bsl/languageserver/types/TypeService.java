@@ -25,6 +25,7 @@ import com.github._1c_syntax.bsl.languageserver.configuration.Language;
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
 import com.github._1c_syntax.bsl.languageserver.context.FileType;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.MethodSymbol;
+import com.github._1c_syntax.bsl.languageserver.context.symbol.ModuleSymbol;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.SourceDefinedSymbol;
 import com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceScope;
 import com.github._1c_syntax.bsl.languageserver.references.ReferenceResolver;
@@ -40,10 +41,7 @@ import com.github._1c_syntax.bsl.languageserver.types.model.TypeSet;
 import com.github._1c_syntax.bsl.languageserver.types.model.UserType;
 import com.github._1c_syntax.bsl.languageserver.types.registry.GlobalScopeProvider;
 import com.github._1c_syntax.bsl.languageserver.types.registry.TypeRegistry;
-import com.github._1c_syntax.bsl.languageserver.types.scope.GlobalSymbolScope;
 import com.github._1c_syntax.bsl.languageserver.types.symbol.PlatformMemberSymbol;
-import com.github._1c_syntax.bsl.languageserver.types.symbol.SyntheticKind;
-import com.github._1c_syntax.bsl.languageserver.types.symbol.SyntheticSymbol;
 import com.github._1c_syntax.bsl.languageserver.utils.Ranges;
 import com.github._1c_syntax.bsl.languageserver.utils.Trees;
 import com.github._1c_syntax.bsl.parser.BSLParser;
@@ -90,12 +88,6 @@ public class TypeService {
     if (sourceDefined.isPresent()) {
       return inferencer.inferSymbol(sourceDefined.get());
     }
-    if (reference.symbol() instanceof SyntheticSymbol synthetic) {
-      var valueType = synthetic.getValueType();
-      if (valueType != null && valueType != TypeRef.UNKNOWN) {
-        return TypeSet.of(valueType);
-      }
-    }
     if (reference.symbol() instanceof PlatformMemberSymbol platformMember) {
       var returnTypes = platformMember.getDescriptor().returnTypes();
       if (returnTypes != null && !returnTypes.isEmpty()) {
@@ -117,15 +109,6 @@ public class TypeService {
    * @return тип охватывающего выражения; {@link TypeSet#EMPTY}, если не выводится.
    */
   public TypeSet expressionTypesAt(DocumentContext documentContext, Position position) {
-    // Инференсер читает глобальный скоуп из GlobalScopeProvider (findGlobalEntry,
-    // moduleTypeByUri), который наполняется как побочный эффект @PostConstruct
-    // bootstrap() workspace-scoped TypeRegistry (registerPack →
-    // globalScopeProvider.registerGlobalProperty/registerPlatformClass). Чтение
-    // GlobalScopeProvider сам этот bootstrap не триггерит, поэтому первый в скоупе
-    // вывод по глобальному символу увидел бы пустой скоуп. Дёргаем TypeRegistry,
-    // чтобы материализовать bean и прогнать bootstrap; resolve("") — самый дешёвый
-    // вызов: на пустом имени сразу возвращает empty.
-    typeRegistry.resolve("");
     return ExpressionAtPosition.findExpressionTree(documentContext, position)
       .map(expression -> inferencer.infer(expression, documentContext))
       .orElse(TypeSet.EMPTY);
@@ -252,12 +235,15 @@ public class TypeService {
   }
 
   /**
-   * Символ-источник, объявивший тип, если такой есть в исходниках рабочей области.
+   * Символ-источник, объявляющий тип (цель go-to-definition и hover), если такой
+   * есть в исходниках рабочей области.
    * <p>
    * Покрывает типы, у которых есть объявляющий их модуль/класс:
    * <ul>
    *   <li>{@link TypeKind#USER} — пользовательские типы OneScript (классы и модули):
-   *       объявление хранится в самом {@link UserType#getDeclaration()};</li>
+   *       объявление хранится в самом {@link UserType#getDeclaration()}. Для класса
+   *       с конструктором предпочитается символ конструктора
+   *       ({@code ПриСозданииОбъекта}) — см. ниже;</li>
    *   <li>{@link TypeKind#CONFIGURATION} — общие модули и модули менеджеров объектов
    *       конфигурации: документ-модуль находится обратным индексом
    *       {@link GlobalScopeProvider#moduleUriByType(TypeRef)}, а его символ —
@@ -266,6 +252,18 @@ public class TypeService {
    * Для платформенных/примитивных типов ({@link TypeKind#PLATFORM},
    * {@link TypeKind#PRIMITIVE}) и служебных {@code Unknown}/{@code Any}
    * объявляющего исходник-символа нет — возвращается {@code empty}.
+   * <p>
+   * <b>Почему для OneScript-класса предпочтён конструктор, а не модуль.</b> У языка
+   * нет отдельного оператора «объявление класса»: класс — это весь {@code .os}-файл,
+   * а его {@link ModuleSymbol#getSelectionRange()} указывает на первый токен файла,
+   * которым часто оказывается {@code Перем} (объявление поля). Потребитель —
+   * {@code InlayHintLabelPart.location}, семантика которого в клиенте: выполнить
+   * hover и go-to-definition <b>в позиции</b> ссылки. На {@code Перем} hover даёт
+   * бесполезное описание ключевого слова, а go-to-definition не находит
+   * source-defined символа и переход не срабатывает. Имя конструктора — это
+   * source-defined метод: hover показывает его сигнатуру, а go-to-definition ведёт
+   * к нему. Для класса без конструктора и не-USER типов цель — модуль/класс
+   * (переход к началу файла).
    *
    * @param typeRef           тип, чей объявляющий символ нужен.
    * @param requestingContext контекст документа-потребителя; через него находится
@@ -276,10 +274,24 @@ public class TypeService {
    */
   public Optional<SourceDefinedSymbol> definingSymbol(TypeRef typeRef, DocumentContext requestingContext) {
     return switch (typeRef.kind()) {
-      case USER -> userTypeDeclaration(typeRef);
+      case USER -> userTypeDeclaration(typeRef).map(TypeService::preferConstructor);
       case CONFIGURATION -> configurationModuleSymbol(typeRef, requestingContext);
       default -> Optional.empty();
     };
+  }
+
+  /**
+   * Для символа-модуля OneScript-класса предпочесть символ конструктора
+   * {@code ПриСозданииОбъекта}, если он есть; иначе вернуть сам символ-модуль
+   * без изменений.
+   */
+  private static SourceDefinedSymbol preferConstructor(SourceDefinedSymbol declaration) {
+    if (declaration instanceof ModuleSymbol module) {
+      return module.getOwner().getSymbolTree().getConstructor()
+        .map(SourceDefinedSymbol.class::cast)
+        .orElse(declaration);
+    }
+    return declaration;
   }
 
   private Optional<SourceDefinedSymbol> userTypeDeclaration(TypeRef typeRef) {
@@ -340,6 +352,88 @@ public class TypeService {
   }
 
   /**
+   * Является ли тип перечислением (системным либо конфигурационным enum'ом)
+   * в данном языке файла.
+   *
+   * @param typeRef тип.
+   * @param fileType язык файла-потребителя (BSL/OS).
+   * @return {@code true}, если тип — перечисление.
+   */
+  public boolean isEnumType(TypeRef typeRef, FileType fileType) {
+    return typeRegistry.isEnumType(typeRef, fileType);
+  }
+
+  /**
+   * Похоже ли имя члена на версионируемое — дешёвый префиксный фильтр перед
+   * полным резолвом члена (например, для отбора кандидатов на проверку
+   * доступности по версии платформы).
+   *
+   * @param name имя члена.
+   * @return {@code true}, если имя имеет версионный вид.
+   */
+  public boolean isVersionedMemberName(String name) {
+    return typeRegistry.isVersionedMemberName(name);
+  }
+
+  /**
+   * Есть ли среди зарегистрированных типов хотя бы один член, помеченный
+   * «только для чтения» — глобальный гейт для диагностики присваивания.
+   *
+   * @return {@code true}, если хотя бы один read-only член известен.
+   */
+  public boolean hasAnyReadOnlyMember() {
+    return typeRegistry.hasAnyReadOnlyMember();
+  }
+
+  /**
+   * Поддерживает ли тип обход {@code Для Каждого} в данном языке файла.
+   *
+   * @param typeRef тип.
+   * @param fileType язык файла-потребителя (BSL/OS).
+   * @return {@code true}, если тип итерируем.
+   */
+  public boolean supportsForEach(TypeRef typeRef, FileType fileType) {
+    return typeRegistry.supportsForEach(typeRef, fileType);
+  }
+
+  /**
+   * Поддерживает ли тип индексный доступ {@code [...]} в данном языке файла.
+   *
+   * @param typeRef тип.
+   * @param fileType язык файла-потребителя (BSL/OS).
+   * @return {@code true}, если тип индексируем.
+   */
+  public boolean supportsIndexAccess(TypeRef typeRef, FileType fileType) {
+    return typeRegistry.supportsIndexAccess(typeRef, fileType);
+  }
+
+  /**
+   * Описание обхода {@code Для Каждого} для типа в указанной локали LS,
+   * в данном языке файла.
+   *
+   * @param typeRef тип.
+   * @param fileType язык файла-потребителя (BSL/OS).
+   * @param language локаль интерфейса LS.
+   * @return описание; пустая строка, если его нет.
+   */
+  public String getForEachDescription(TypeRef typeRef, FileType fileType, Language language) {
+    return typeRegistry.getForEachDescription(typeRef, fileType, language);
+  }
+
+  /**
+   * Описание индексного доступа {@code [...]} для типа в указанной локали LS,
+   * в данном языке файла.
+   *
+   * @param typeRef тип.
+   * @param fileType язык файла-потребителя (BSL/OS).
+   * @param language локаль интерфейса LS.
+   * @return описание; пустая строка, если его нет.
+   */
+  public String getIndexAccessDescription(TypeRef typeRef, FileType fileType, Language language) {
+    return typeRegistry.getIndexAccessDescription(typeRef, fileType, language);
+  }
+
+  /**
    * Найти член типа в позиции курсора (для hover/go-to-member по
    * выражениям без source-defined символа: цепочки accessor'ов,
    * платформенные типы, library-модули).
@@ -397,30 +491,23 @@ public class TypeService {
    */
   private Optional<TypedMember> resolveBareName(TerminalNode terminal, DocumentContext documentContext) {
     var bareName = terminal.getText();
-    // Триггерим bootstrap TypeRegistry в текущем workspace scope, чтобы
-    // exposedAsGlobal-типы (system enums и пр.) попали в GlobalSymbolScope.
-    typeRegistry.resolve(bareName);
-
     var fileType = documentContext.getFileType();
-    var globalFn = globalScopeProvider.findFunction(bareName, fileType);
+    // Глобальная функция.
+    var globalFn = globalScopeProvider.globalFunction(bareName, fileType);
     if (globalFn.isPresent()) {
       return Optional.of(new TypedMember(null, globalFn.get(), Ranges.create(terminal), -1));
     }
 
-    return globalScopeProvider.findGlobalEntry(bareName, fileType)
-      .filter(e -> e.role() != GlobalSymbolScope.Role.TYPE_NAME)
-      .map(GlobalSymbolScope.Entry::symbol)
-      .filter(SyntheticSymbol.class::isInstance)
-      .map(SyntheticSymbol.class::cast)
-      .filter(s -> s.getSyntheticKind() != SyntheticKind.PLATFORM_GLOBAL_METHOD)
-      .filter(s -> !s.getValueType().equals(TypeRef.UNKNOWN))
-      .map((SyntheticSymbol sym) -> {
-        var ref = sym.getValueType();
-        var desc = sym.getDescription();
-        if (desc == null || desc.isBlank()) {
-          desc = typeRegistry.getDescription(ref, fileType);
-        }
-        return new TypedMember(ref,
+    // Глобальное свойство (перечисление/менеджер коллекции/модуль); имена типов
+    // для `Новый` (TYPE_NAME) глобальными свойствами не являются.
+    return globalScopeProvider.globalProperty(bareName, fileType)
+      .map(member -> member.returnTypes().refs().stream()
+        .filter(r -> !r.equals(TypeRef.UNKNOWN)).findFirst().orElse(TypeRef.UNKNOWN))
+      .filter(ref -> !ref.equals(TypeRef.UNKNOWN))
+      .map((TypeRef ref) -> {
+        var desc = typeRegistry.getDescription(ref, fileType);
+        // owner == null: глобальное свойство, а не член ресивера (контракт TypedMember).
+        return new TypedMember(null,
           MemberDescriptor.property(ref.qualifiedName(), ref, desc),
           Ranges.create(terminal));
       });

@@ -228,6 +228,97 @@ class BslDocSemanticTokensSupplierTest {
   }
 
   @Test
+  void testElementsInDescriptionStartingAtNonZeroColumn() {
+    // given - описание, начинающееся не с начала строки (висячий/trailing комментарий после Перем),
+    // который к тому же становится описанием следующего метода. Элементы (ключевые слова, типы)
+    // в первой строке такого описания должны подсвечиваться по своим реальным позициям,
+    // а не «съезжать» на величину отступа описания.
+    String bsl = """
+      Перем П; // Параметры:
+      //  Парам - Строка - описание
+      Процедура Тест(Парам)
+      КонецПроцедуры
+      """;
+
+    // when
+    var decoded = helper.getDecodedTokens(bsl, supplier);
+
+    // then - "Параметры:" подсвечивается на позиции 12 (а не 21 из-за двойного смещения),
+    // "Строка" на второй строке (со столбца 0) не затронута и остаётся на позиции 12.
+    helper.assertContainsTokens(decoded, List.of(
+      new ExpectedToken(0, 12, 10, SemanticTokenTypes.Macro,
+        Set.of(SemanticTokenModifiers.Documentation), "Параметры:"),
+      new ExpectedToken(1, 12, 6, SemanticTokenTypes.Type,
+        Set.of(SemanticTokenModifiers.Documentation), "Строка")
+    ));
+  }
+
+  @Test
+  void testTrailingVariableDescriptionTypeHighlighting() {
+    // given - висячий (trailing) комментарий переменной с типом в начале (нотация «тип в начале»).
+    // Описание начинается не со столбца 0, поэтому проверяем сквозную работу:
+    // bsl-parser отдаёт TYPE_NAME-элемент в абсолютных координатах, а сапплаер подсвечивает его
+    // как тип ровно на позиции типа, без «съезжания» из-за отступа описания.
+    String bsl = """
+      Процедура Тест()
+          Перем Стр; // Строка - описание переменной
+      КонецПроцедуры
+      """;
+
+    // when
+    var decoded = helper.getDecodedTokens(bsl, supplier);
+
+    // then - "Строка" подсвечивается как тип на позиции 18 (а не со смещением на отступ описания).
+    helper.assertContainsTokens(decoded, List.of(
+      new ExpectedToken(1, 18, 6, SemanticTokenTypes.Type,
+        Set.of(SemanticTokenModifiers.Documentation), "Строка")
+    ));
+  }
+
+  @Test
+  void testTrailingVariableDescriptionUnresolvedTypeNotHighlighted() {
+    // given - висячий комментарий, у которого первый токен (по нотации «тип в начале») — свободный
+    // текст, не резолвящийся в реальный тип.
+    String bsl = """
+      Процедура Тест()
+          Перем П; // привет - это не тип
+      КонецПроцедуры
+      """;
+
+    // when
+    var decoded = helper.getDecodedTokens(bsl, supplier);
+
+    // then - «привет» не подсвечивается как тип: весь висячий комментарий остаётся
+    // одним комментарием-документацией (не разрезается Type-токеном).
+    helper.assertContainsTokens(decoded, List.of(
+      new ExpectedToken(1, 13, 22, SemanticTokenTypes.Comment,
+        Set.of(SemanticTokenModifiers.Documentation), "// привет - это не тип")
+    ));
+  }
+
+  @Test
+  void testTrailingVariableCollectionTypeHighlighting() {
+    // given - висячий комментарий с типом-коллекцией «Массив из Число»: подсвечиваться должны
+    // и тип-голова (Массив), и тип-значение коллекции (Число), а не только голова.
+    String bsl = """
+      Процедура Тест()
+          Перем Контейнер Экспорт; // Массив из Число
+      КонецПроцедуры
+      """;
+
+    // when
+    var decoded = helper.getDecodedTokens(bsl, supplier);
+
+    // then - и «Массив», и «Число» подсвечены как тип («из» — разделитель, остаётся комментарием).
+    helper.assertContainsTokens(decoded, List.of(
+      new ExpectedToken(1, 32, 6, SemanticTokenTypes.Type,
+        Set.of(SemanticTokenModifiers.Documentation), "Массив"),
+      new ExpectedToken(1, 42, 5, SemanticTokenTypes.Type,
+        Set.of(SemanticTokenModifiers.Documentation), "Число")
+    ));
+  }
+
+  @Test
   void testMultilineSupport() {
     // given
     String bsl = """

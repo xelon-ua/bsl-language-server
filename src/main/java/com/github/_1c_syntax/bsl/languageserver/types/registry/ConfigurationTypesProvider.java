@@ -140,6 +140,7 @@ public class ConfigurationTypesProvider {
 
   private final AtomicBoolean registered = new AtomicBoolean(false);
 
+
   @EventListener
   public void handleEvent(ServerContextPopulatedEvent event) {
     tryRegister();
@@ -328,7 +329,10 @@ public class ConfigurationTypesProvider {
       }
       typeRegistry.registerDisplayName(ref, BilingualString.of(collectionRu, collectionEn));
       typeRegistry.registerMemberSource(ref, () -> members, FileType.BSL);
-      typeRegistry.registerAsGlobalProperty(ref, FileType.BSL);
+
+      // коллекция-namespace — глобальное свойство (имя/bilingual и value-type
+      // реестр соберёт сам из displayName/ref; declaration у коллекции нет).
+      typeRegistry.registerGlobalPropertyType(ref, FileType.BSL);
 
       // Платформенные методы коллекции-менеджера (СправочникиМенеджер,
       // ДокументыМенеджер) — уровня всех справочников/документов, например
@@ -520,8 +524,7 @@ public class ConfigurationTypesProvider {
         typeRegistry.registerMemberSource(collRef, columnSource, FileType.BSL);
       }
 
-      // Табличная часть — метаданные конфигурации, не платформенный API → не defaultLibrary.
-      tsMembers.add(MemberDescriptor.property(tsName, collRef).withStandardLibrary(false));
+      tsMembers.add(MemberDescriptor.property(tsName, collRef));
     }
     if (!tsMembers.isEmpty()) {
       var immutableTs = List.copyOf(tsMembers);
@@ -831,8 +834,10 @@ public class ConfigurationTypesProvider {
         descriptor = descriptor.withMetadata(meta);
       }
       // Стандартные реквизиты (Наименование/Код/Ссылка/…) — часть платформенной
-      // объектной модели → defaultLibrary; собственные реквизиты конфигурации — нет.
-      descriptor = descriptor.withStandardLibrary(attribute instanceof StandardAttribute);
+      // объектной модели; собственные реквизиты конфигурации — нет.
+      if (attribute instanceof StandardAttribute) {
+        descriptor = descriptor.withStandardLibrary(true);
+      }
       result.add(descriptor);
     }
     return result;
@@ -938,16 +943,13 @@ public class ConfigurationTypesProvider {
         continue;
       }
       var returnTypes = resolveCommonAttributeReturnTypes(ca);
-      MemberDescriptor descriptor;
       if (returnTypes.isEmpty()) {
-        descriptor = MemberDescriptor.property(attrName);
+        result.add(MemberDescriptor.property(attrName));
       } else if (returnTypes.size() == 1) {
-        descriptor = MemberDescriptor.property(attrName, returnTypes.refs().iterator().next());
+        result.add(MemberDescriptor.property(attrName, returnTypes.refs().iterator().next()));
       } else {
-        descriptor = MemberDescriptor.property(attrName, returnTypes, "");
+        result.add(MemberDescriptor.property(attrName, returnTypes, ""));
       }
-      // Общие реквизиты — метаданные конфигурации, не платформенный API → не defaultLibrary.
-      result.add(descriptor.withStandardLibrary(false));
     }
     return result;
   }

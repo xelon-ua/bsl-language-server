@@ -33,8 +33,10 @@ import com.github._1c_syntax.bsl.languageserver.types.model.ParameterDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.SignatureDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeRef;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeSet;
+import com.github._1c_syntax.bsl.languageserver.types.MemberTypeFromCommentResolver;
 import com.github._1c_syntax.bsl.languageserver.types.registry.GlobalScopeProvider;
 import com.github._1c_syntax.bsl.languageserver.types.registry.TypeRegistry;
+import com.github._1c_syntax.bsl.languageserver.utils.DescriptionTypes;
 import com.github._1c_syntax.bsl.types.ModuleType;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -81,6 +83,8 @@ public class OScriptModuleMembersProvider {
   private final GlobalScopeProvider globalScopeProvider;
   private final OScriptExtends oScriptExtends;
   private final TypeRelations typeRelations;
+  private final OScriptIterable oScriptIterable;
+  private final MemberTypeFromCommentResolver memberTypeFromCommentResolver;
 
   /** URI документа → множество qualifiedNames зарегистрированных типов
    *  (один .os может одновременно быть и модулем, и классом). */
@@ -106,7 +110,11 @@ public class OScriptModuleMembersProvider {
     var libraryEntries = oScriptLibraryIndex.findEntriesByUri(uri);
     if (libraryEntries.isEmpty()) {
       // не библиотечный .os — регистрируем по basename как USER-тип.
-      registerOne(documentContext, FilenameUtils.getBaseName(uri.getPath()), null);
+      // NFC-нормализация: имя файла на macOS хранится в NFD и иначе не совпадёт
+      // с идентификатором типа в исходном коде (NFC). См. OScriptLibraryIndex#nameKey.
+      var baseName = java.text.Normalizer.normalize(
+        FilenameUtils.getBaseName(uri.getPath()), java.text.Normalizer.Form.NFC);
+      registerOne(documentContext, baseName, null);
       return;
     }
     // Для библиотечного файла регистрируем каждую роль (модуль и/или класс)
@@ -128,20 +136,27 @@ public class OScriptModuleMembersProvider {
     var module = documentContext.getSymbolTree().getModule();
     var ref = typeRegistry.registerUserType(qualifiedName, module, FileType.OS);
 
+    // Признак обходимой коллекции (&Обходимое) выставляется при каждой
+    // регистрации, а не только при первой: так добавление/удаление аннотации
+    // подхватывается hot-reload без ре-регистрации типа.
+    typeRegistry.setUserTypeIterable(ref, oScriptIterable.isIterable(documentContext), FileType.OS);
+
     if (firstTimeForName) {
       typeRegistry.registerMemberSource(ref, () -> collectMembers(documentContext), FileType.OS);
       if (libraryEntry != null) {
         if (libraryEntry.kind() == OScriptLibraryIndex.EntryKind.CLASS) {
           typeRegistry.registerConstructorSource(ref, () -> collectConstructors(documentContext, ref), FileType.OS);
           registerInheritedMembers(documentContext, ref);
-          globalScopeProvider.registerLibraryClass(qualifiedName, ref);
         } else if (libraryEntry.kind() == OScriptLibraryIndex.EntryKind.MODULE) {
           // Обратный индекс URI→тип для вывода типа ресивера-модуля по ModuleSymbol
           // (единый источник в GlobalScopeProvider вместо обращения инференсера к
           // oScriptLibraryIndex). Только для роли MODULE: у dual-role .os-файла
           // роль CLASS не должна перетирать тип модуля под тем же URI.
           globalScopeProvider.indexModuleType(uri, ref);
-          globalScopeProvider.registerLibraryModule(qualifiedName, ref);
+          // library-модуль — глобальное свойство (OS).
+          // declaration уже хранит UserType (registerUserType выше), поэтому
+          // символ не передаём; член собирает сам TypeRegistry (override-source).
+          typeRegistry.registerGlobalPropertyType(ref, FileType.OS);
         }
       } else if (documentContext.getModuleType() == ModuleType.OScriptClass) {
         typeRegistry.registerConstructorSource(ref, () -> collectConstructors(documentContext, ref), FileType.OS);
@@ -164,9 +179,10 @@ public class OScriptModuleMembersProvider {
       return;
     }
     for (var name : names) {
+      // снять пометку глобального свойства до удаления типа (resolve по имени)
+      typeRegistry.resolve(name)
+        .ifPresent(ref -> typeRegistry.unregisterGlobalPropertyType(ref, FileType.OS));
       typeRegistry.unregisterUserType(name);
-      globalScopeProvider.unregisterLibraryModule(name);
-      globalScopeProvider.unregisterLibraryClass(name);
     }
   }
 
@@ -203,10 +219,25 @@ public class OScriptModuleMembersProvider {
     }
     for (VariableSymbol variable : symbolTree.getVariables()) {
       if (variable.isExport()) {
-        members.add(MemberDescriptor.property(variable.getName()));
+        var types = propertyTypesFromComment(variable);
+        if (types.isEmpty()) {
+          members.add(MemberDescriptor.property(variable.getName()));
+        } else {
+          members.add(MemberDescriptor.property(variable.getName(), types, ""));
+        }
       }
     }
     return members;
+  }
+
+  /**
+   * Типы экспортной переменной-свойства из типизирующего висячего комментария
+   * её декларации ({@code Перем Контейнер Экспорт; // Массив из Число},
+   * {@code Перем Сложно Экспорт; // см. НовыйСложно}). Делегирует общему для обоих
+   * языков {@link MemberTypeFromCommentResolver}.
+   */
+  private TypeSet propertyTypesFromComment(VariableSymbol variable) {
+    return memberTypeFromCommentResolver.resolve(variable, FileType.OS);
   }
 
   private List<SignatureDescriptor> collectConstructors(DocumentContext documentContext, TypeRef classRef) {
@@ -268,7 +299,10 @@ public class OScriptModuleMembersProvider {
     }
     var refs = new ArrayList<TypeRef>(types.size());
     for (var td : types) {
-      typeRegistry.resolve(td.name()).ifPresent(refs::add);
+      var name = DescriptionTypes.resolveName(td);
+      if (!name.isBlank()) {
+        typeRegistry.resolve(name).ifPresent(refs::add);
+      }
     }
     return refs.isEmpty() ? TypeSet.EMPTY : TypeSet.of(refs);
   }
