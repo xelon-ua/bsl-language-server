@@ -28,24 +28,34 @@ import com.github._1c_syntax.bsl.languageserver.mcp.tools.CallHierarchyTool;
 import com.github._1c_syntax.bsl.languageserver.mcp.tools.DefinitionTool;
 import com.github._1c_syntax.bsl.languageserver.mcp.tools.DocumentSymbolsTool;
 import com.github._1c_syntax.bsl.languageserver.mcp.tools.FindReferencesTool;
+import com.github._1c_syntax.bsl.languageserver.mcp.tools.GlobalMemberCategory;
 import com.github._1c_syntax.bsl.languageserver.mcp.tools.GlobalMemberInfoTool;
+import com.github._1c_syntax.bsl.languageserver.mcp.tools.GlobalMemberSearchTool;
 import com.github._1c_syntax.bsl.languageserver.mcp.tools.HoverTool;
 import com.github._1c_syntax.bsl.languageserver.mcp.tools.TypeAtPositionTool;
 import com.github._1c_syntax.bsl.languageserver.mcp.tools.TypeInfoTool;
 import com.github._1c_syntax.bsl.languageserver.mcp.dto.TypeMemberDto;
+import com.github._1c_syntax.bsl.languageserver.types.TypeService;
+import com.github._1c_syntax.bsl.languageserver.types.model.TypeRef;
 import com.github._1c_syntax.bsl.languageserver.util.CleanupContextBeforeClassAndAfterEachTestMethod;
 import com.github._1c_syntax.utils.Absolute;
 import io.modelcontextprotocol.spec.McpSchema.Root;
+import org.eclipse.lsp4j.Position;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.ActiveProfiles;
 
+import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 /**
  * Проверяет MCP-инструменты поверх общего {@code ServerContextProvider}.
@@ -91,7 +101,16 @@ class McpToolsTest {
   @Autowired
   private GlobalMemberInfoTool globalMemberInfoTool;
   @Autowired
+  private GlobalMemberSearchTool globalMemberSearchTool;
+  @Autowired
   private McpRootsChangeConsumer rootsChangeConsumer;
+  @Autowired
+  private McpDocumentReader documentReader;
+  @Autowired
+  private TypeService typeService;
+  @Autowired
+  @Qualifier("diagnosticComputerExecutor")
+  private ExecutorService diagnosticComputerExecutor;
 
   @BeforeEach
   void indexWorkspace() {
@@ -105,6 +124,46 @@ class McpToolsTest {
     assertThat(result.file()).isEqualTo(FILE);
     assertThat(result.diagnostics()).isNotNull();
     assertThat(result.diagnosticsCount()).isEqualTo(result.diagnostics().size());
+  }
+
+  @Test
+  void analyzeDoesNotDeadlockWhenActionTriggersAutumnIndexBuild() {
+    // Регресс на дедлок MCP-инструмента analyze_file на .os-классах фреймворка «ОСень».
+    // Разбор держит блокировку документа на запись, пока считаются диагностики (на отдельном пуле).
+    // Вывод типа внедрённого через ОСень бина запускает ленивую сборку Autumn-индекса, а она
+    // реентрантно берёт блокировку того же документа на чтение — под чужой записью это вечный дедлок.
+    // Кросс-поточность обязательна: на потоке-владельце записи то же чтение переиспользовало бы
+    // блокировку и баг бы не проявился. Пул берём тот же, чтобы пробросить контекст рабочего пространства.
+    var autumnDir = "src/test/resources/mcp/autumn-deadlock";
+    var autumnFile = autumnDir + "/src/Приложение.os";
+    workspaceBootstrap.index(Absolute.path(autumnDir));
+
+    var types = assertTimeoutPreemptively(Duration.ofSeconds(60),
+      () -> documentReader.analyze(autumnFile, document -> {
+        var lines = document.getContentList();
+        var line = -1;
+        for (var i = 0; i < lines.length; i++) {
+          if (lines[i].contains("Возврат Логгер")) {
+            line = i;
+          }
+        }
+        assertThat(line).as("строка с обращением к внедрённому бину не найдена в фикстуре").isNotEqualTo(-1);
+        var position = new Position(line, lines[line].indexOf("Логгер") + 1);
+        try {
+          return diagnosticComputerExecutor
+            .submit(() -> typeService.expressionTypesAt(document, position))
+            .get();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new IllegalStateException(e);
+        } catch (ExecutionException e) {
+          throw new IllegalStateException(e);
+        }
+      }));
+
+    // Проверяем не только отсутствие дедлока, но и что вывод типа реально дошёл до Autumn-резолва:
+    // получатель `Логгер` резолвится в одноимённый желудь (иначе цепочка до сборки индекса не дошла бы).
+    assertThat(types.refs()).extracting(TypeRef::qualifiedName).contains("Логгер");
   }
 
   @Test
@@ -245,6 +304,97 @@ class McpToolsTest {
     var result = globalMemberInfoTool.globalMemberInfo("Сообщить", FileType.OS, WORKSPACE_ROOT, null);
 
     assertThat(result.kind()).isEqualTo("FUNCTION");
+  }
+
+  @Test
+  void globalMemberSearchListsAllCategoriesByDefault() {
+    var result = globalMemberSearchTool.globalMemberSearch(FileType.BSL, WORKSPACE_ROOT, null, null, null);
+
+    assertThat(result.count())
+      .isEqualTo(result.functions().size() + result.properties().size() + result.enums().size());
+    assertThat(result.functions()).isNotEmpty();
+    assertThat(result.functions()).extracting(TypeMemberDto::name).contains("Сообщить");
+    // Свойства и перечисления тоже должны присутствовать в полной выборке.
+    assertThat(result.properties()).isNotEmpty();
+    assertThat(result.enums()).isNotEmpty();
+  }
+
+  @Test
+  void globalMemberSearchRestrictsToRequestedCategories() {
+    var result = globalMemberSearchTool.globalMemberSearch(
+      FileType.BSL, WORKSPACE_ROOT, null, List.of(GlobalMemberCategory.FUNCTION), null);
+
+    assertThat(result.functions()).isNotEmpty();
+    assertThat(result.properties()).isEmpty();
+    assertThat(result.enums()).isEmpty();
+    assertThat(result.count()).isEqualTo(result.functions().size());
+  }
+
+  @Test
+  void globalMemberSearchReturnsOnlyEnumsWhenRequested() {
+    var result = globalMemberSearchTool.globalMemberSearch(
+      FileType.BSL, WORKSPACE_ROOT, null, List.of(GlobalMemberCategory.ENUM), null);
+
+    assertThat(result.enums()).isNotEmpty();
+    assertThat(result.functions()).isEmpty();
+    assertThat(result.properties()).isEmpty();
+  }
+
+  @Test
+  void globalMemberSearchMatchesFuzzilyAcrossCategories() {
+    var result = globalMemberSearchTool.globalMemberSearch(FileType.BSL, WORKSPACE_ROOT, "Сообщ", null, null);
+
+    assertThat(result.functions()).extracting(TypeMemberDto::name).contains("Сообщить");
+    assertThat(result.functions()).allSatisfy(member ->
+      assertThat(member.name().toLowerCase()).contains("сообщ"));
+  }
+
+  @Test
+  void globalMemberSearchRanksExactPrefixMatchFirst() {
+    // Запрос совпадает как префикс с «Сообщить» и как подпоследовательность с другими именами —
+    // более релевантное «Сообщить» должно быть выше в выдаче (ранжирование, как в автодополнении).
+    var result = globalMemberSearchTool.globalMemberSearch(
+      FileType.BSL, WORKSPACE_ROOT, "Сообщить", List.of(GlobalMemberCategory.FUNCTION), null);
+
+    assertThat(result.functions()).isNotEmpty();
+    assertThat(result.functions().get(0).name()).isEqualTo("Сообщить");
+  }
+
+  @Test
+  void globalMemberSearchReturnsEmptyForUnmatchedQuery() {
+    var result = globalMemberSearchTool.globalMemberSearch(
+      FileType.BSL, WORKSPACE_ROOT, "btzzzqqqxyz", null, null);
+
+    assertThat(result.count()).isZero();
+    assertThat(result.functions()).isEmpty();
+    assertThat(result.properties()).isEmpty();
+    assertThat(result.enums()).isEmpty();
+  }
+
+  @Test
+  void globalMemberSearchAcceptsOscriptFileType() {
+    var result = globalMemberSearchTool.globalMemberSearch(FileType.OS, WORKSPACE_ROOT, null, null, null);
+
+    assertThat(result.functions()).isNotEmpty();
+    assertThat(result.functions()).extracting(TypeMemberDto::name).contains("Сообщить");
+  }
+
+  @Test
+  void globalMemberSearchThrowsWhenRootIsUnknown() {
+    var unknownRoot = Absolute.path("src/test/resources/diagnostics").toUri().toString();
+
+    assertThatThrownBy(() ->
+      globalMemberSearchTool.globalMemberSearch(FileType.BSL, unknownRoot, null, null, null))
+      .isInstanceOf(IllegalArgumentException.class)
+      .hasMessageContaining("No registered workspace matches root");
+  }
+
+  @Test
+  void globalMemberSearchThrowsWhenRootIsMissing() {
+    assertThatThrownBy(() ->
+      globalMemberSearchTool.globalMemberSearch(FileType.BSL, null, null, null, null))
+      .isInstanceOf(IllegalArgumentException.class)
+      .hasMessageContaining("Workspace root is required");
   }
 
   @Test

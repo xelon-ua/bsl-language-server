@@ -21,17 +21,22 @@
  */
 package com.github._1c_syntax.bsl.languageserver.context;
 
-import com.github._1c_syntax.bsl.languageserver.WorkDoneProgressHelper;
+import com.github._1c_syntax.bsl.languageserver.client.WorkDoneProgressHelper;
 import com.github._1c_syntax.bsl.languageserver.configuration.GlobalLanguageServerConfiguration;
+import com.github._1c_syntax.bsl.languageserver.configuration.Language;
 import com.github._1c_syntax.bsl.languageserver.configuration.LanguageServerConfiguration;
 import com.github._1c_syntax.bsl.languageserver.utils.BSLFiles;
-import com.github._1c_syntax.bsl.languageserver.utils.Resources;
-import com.github._1c_syntax.bsl.mdclasses.CF;
+import com.github._1c_syntax.bsl.languageserver.configuration.Resources;
 import com.github._1c_syntax.bsl.mdclasses.MDCReadSettings;
 import com.github._1c_syntax.bsl.mdclasses.MDClasses;
+import com.github._1c_syntax.bsl.mdclasses.Solution;
+import com.github._1c_syntax.bsl.mdo.CommonModule;
+import com.github._1c_syntax.bsl.types.ConfigurationSource;
 import com.github._1c_syntax.bsl.types.ModuleType;
+import com.github._1c_syntax.bsl.types.ScriptVariant;
 import com.github._1c_syntax.utils.Absolute;
 import com.github._1c_syntax.utils.Lazy;
+import com.github.benmanes.caffeine.cache.Cache;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.Setter;
@@ -72,7 +77,6 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 public class ServerContext {
   private static final MDCReadSettings SOLUTION_READ_SETTINGS = MDCReadSettings.builder()
     .skipDataCompositionSchema(true)
-    .skipXdtoPackage(true)
     .build();
 
   private final ObjectProvider<DocumentContext> documentContextProvider;
@@ -82,6 +86,15 @@ public class ServerContext {
   private final ExecutorService computeConfigurationExecutor;
   @Qualifier("populateContextExecutor")
   private final ExecutorService populateContextExecutor;
+
+  /**
+   * Ограниченный кэш резолва общего модуля по имени ({@code имя -> Optional<CommonModule>},
+   * кэшируются и промахи) — workspace-scoped бин (см. {@code CacheConfiguration#commonModuleCache}).
+   * Резолв зависит только от конфигурации воркспейса, а {@code findCommonModule} вызывается на
+   * каждый идентификатор при заполнении индекса ссылок — memo снимает повторное сворачивание
+   * регистра в {@code CaseInsensitiveMap} конфигурации. Сбрасывается в {@link #clear()}.
+   */
+  private final Cache<String, Optional<CommonModule>> commonModuleCache;
 
   @Getter
   @Setter
@@ -94,7 +107,7 @@ public class ServerContext {
   private URI workspaceUri;
 
   private final Map<URI, DocumentContext> documents = new ConcurrentHashMap<>();
-  private final Lazy<CF> configurationMetadata = new Lazy<>(this::computeConfigurationMetadata);
+  private final Lazy<Solution> configurationMetadata = new Lazy<>(this::computeConfigurationMetadata);
   @Nullable
   @Setter
   @Getter
@@ -321,6 +334,7 @@ public class ServerContext {
     documentsByMDORef.clear();
     mdoRefs.clear();
     documentLocks.clear();
+    commonModuleCache.invalidateAll();
     configurationMetadata.clear();
   }
 
@@ -436,8 +450,55 @@ public class ServerContext {
     documentContext.clearSecondaryData();
   }
 
-  public CF getConfiguration() {
+  public Solution getConfiguration() {
     return configurationMetadata.getOrCompute();
+  }
+
+  /**
+   * Язык исходников проекта: для конфигурации с заданным {@code ScriptVariant} — именно он
+   * (русский/английский); для проекта без mdclasses-конфы и при нераспознанном варианте —
+   * {@link LanguageServerConfiguration#getLanguage()}.
+   * <p>
+   * Этот язык — преобладающий в коде: на нём пишет пользователь и на нём же платформа
+   * заполняет то, что зависит от варианта языка. Не путать с языком интерфейса LS.
+   * <p>
+   * Расчёт живёт здесь, а не у документа, потому что зависит только от конфигурации
+   * рабочей области — его спрашивают и там, где документа нет (регистрация типов).
+   * У документа остаётся единственная своя поправка — OS-файл
+   * (см. {@link DocumentContext#getScriptVariantLanguage()}).
+   *
+   * @return язык исходников проекта.
+   */
+  public Language getScriptVariantLanguage() {
+    var mdConfiguration = getConfiguration();
+    if (mdConfiguration.getConfigurationSource() == ConfigurationSource.EMPTY) {
+      return getLanguageServerConfiguration().getLanguage();
+    }
+    var scriptVariant = mdConfiguration.getScriptVariant();
+    if (scriptVariant == ScriptVariant.UNKNOWN) {
+      // Не удалось определить язык встроенного языка конфигурации — мягкий фолбэк на
+      // UI-язык LS (бросать нельзя: метод дёргается в hot-path completion/hover).
+      return getLanguageServerConfiguration().getLanguage();
+    }
+    return "en".equalsIgnoreCase(scriptVariant.shortName()) ? Language.EN : Language.RU;
+  }
+
+  /**
+   * Найти общий модуль по имени с мемоизацией (ограниченный кэш {@link #commonModuleCache}).
+   * Эквивалентно {@code getConfiguration().findCommonModule(name)}, но без повторного прохода
+   * по case-insensitive карте конфигурации на каждый вызов.
+   * <p>
+   * Ключ кэша — сырой текст идентификатора (намеренно не нормализуется): на попадании это дешёвый
+   * lookup без сворачивания регистра — ровно то, ради чего кэш и нужен. {@code toLowerCase} на
+   * каждый вызов вернул бы посимвольное сворачивание + аллокацию строки на горячий путь, а
+   * экономия (схлопывание редких регистровых вариантов одного имени) — околонулевая. Сам резолв
+   * внутри остаётся регистронезависимым.
+   *
+   * @param name имя общего модуля
+   * @return общий модуль или {@link Optional#empty()}, если такого нет
+   */
+  public Optional<CommonModule> findCommonModule(String name) {
+    return commonModuleCache.get(name, key -> getConfiguration().findCommonModule(key));
   }
 
   private DocumentContext createDocumentContext(URI uri) {
@@ -449,24 +510,24 @@ public class ServerContext {
     return documentContext;
   }
 
-  private CF computeConfigurationMetadata() {
+  private Solution computeConfigurationMetadata() {
     if (configurationRoot == null) {
-      return (CF) MDClasses.createConfiguration();
+      return Solution.EMPTY;
     }
 
     var progress = workDoneProgressHelper.createProgress(0, "");
     progress.beginProgress(getMessage("computeConfigurationMetadata"));
 
-    CF configuration;
+    Solution configuration;
     try {
-      configuration = (CF) computeConfigurationExecutor.submit(
+      configuration = computeConfigurationExecutor.submit(
         () -> MDClasses.createSolution(configurationRoot, SOLUTION_READ_SETTINGS)).get();
     } catch (ExecutionException e) {
       LOGGER.error("Can't parse configuration metadata. Execution exception: {}", e.getMessage(), e);
-      configuration = (CF) MDClasses.createConfiguration();
+      configuration = Solution.EMPTY;
     } catch (InterruptedException e) {
       LOGGER.error("Can't parse configuration metadata. Interrupted exception: {}", e.getMessage(), e);
-      configuration = (CF) MDClasses.createConfiguration();
+      configuration = Solution.EMPTY;
       Thread.currentThread().interrupt();
     }
 

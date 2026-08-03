@@ -21,12 +21,12 @@
  */
 package com.github._1c_syntax.bsl.languageserver.codelenses;
 
-import com.github._1c_syntax.bsl.languageserver.ClientCapabilitiesHolder;
+import com.github._1c_syntax.bsl.languageserver.client.ClientCapabilitiesHolder;
 import com.github._1c_syntax.bsl.languageserver.codelenses.testrunner.TestRunnerAdapter;
 import com.github._1c_syntax.bsl.languageserver.configuration.LanguageServerConfiguration;
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.MethodSymbol;
-import com.github._1c_syntax.bsl.languageserver.utils.Resources;
+import com.github._1c_syntax.bsl.languageserver.configuration.Resources;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.eclipse.lsp4j.CodeLens;
@@ -61,6 +61,14 @@ public class RunAllTestsCodeLensSupplier
   @Getter
   private RunAllTestsCodeLensSupplier self;
 
+  /**
+   * Конструктор поставщика линзы запуска всех тестов документа.
+   *
+   * @param configuration           Конфигурация language server.
+   * @param clientCapabilitiesHolder Хранилище клиентских возможностей.
+   * @param testRunnerAdapter       Адаптер внешнего раннера тестов.
+   * @param resources               Локализованные ресурсы сервера.
+   */
   public RunAllTestsCodeLensSupplier(
     LanguageServerConfiguration configuration,
     ClientCapabilitiesHolder clientCapabilitiesHolder,
@@ -108,6 +116,7 @@ public class RunAllTestsCodeLensSupplier
 
     var command = new Command();
     command.setTitle(resources.getResourceString(getClass(), "runAllTests"));
+    command.setTooltip(resources.getResourceString(getClass(), "tooltip"));
     command.setCommand(COMMAND_ID);
     command.setArguments(List.of(Map.of("text", runText)));
 
@@ -124,6 +133,13 @@ public class RunAllTestsCodeLensSupplier
     return DefaultCodeLensData.class;
   }
 
+  /**
+   * Построить неразрешённую линзу запуска всех тестов на первом методе документа.
+   *
+   * @param method          Символ первого метода документа (место отрисовки линзы).
+   * @param documentContext Контекст документа.
+   * @return Неразрешённая линза с данными для последующего резолва.
+   */
   private CodeLens toCodeLens(MethodSymbol method, DocumentContext documentContext) {
 
     var codeLensData = new DefaultCodeLensData(documentContext.getUri(), getId());

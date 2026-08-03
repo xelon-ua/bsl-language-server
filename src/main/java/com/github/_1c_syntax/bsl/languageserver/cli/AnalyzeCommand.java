@@ -185,28 +185,35 @@ public class AnalyzeCommand implements Callable<Integer> {
     // Update global configuration
     globalConfiguration.update(configurationFile);
 
+    // -c влияет и на глобальную, и на per-workspace конфигурацию (в analyze всегда ровно один
+    // workspace). Обновляем workspace-scoped конфигурацию ДО addWorkspace, чтобы тот сам
+    // подхватил из неё configurationRoot (см. ServerContextProvider#addWorkspace) и типы
+    // конфигурации зарегистрировались уже на WorkspaceAddedEvent — без отдельного события.
+    // forUri с именем задаёт контекст для ещё не зарегистрированного workspace; addWorkspace
+    // зарегистрирует его позже и прочитает уже обновлённую конфигурацию (тот же инстанс LSC).
+    try (var ctx = WorkspaceContextHolder.forUri(srcDir.toUri(), srcDir.getFileName().toString())) {
+      configuration.update(configurationFile);
+    }
+
     // Create workspace for srcDir (factory will create per-workspace configuration)
     serverContext = serverContextProvider.addWorkspace(srcDir.toUri());
 
     try (var ctx = WorkspaceContextHolder.forUri(srcDir.toUri())) {
-      // In analyze mode, -c affects both global and per-workspace settings
-      // since there is always exactly one workspace
-      configuration.update(configurationFile);
-
-      var configurationPath = LanguageServerConfiguration.getCustomConfigurationRoot(configuration, srcDir);
-      serverContext.setConfigurationRoot(configurationPath);
-
       var files = new ArrayList<>(BSLFiles.listBslFiles(srcDir, configuration.getExcludePaths()));
 
       serverContext.populateContext(files);
 
       var filesToAnalyze = filterByFileList(files, workspaceDir);
 
+      // Метрики вычисляются лениво и стоят дорого. Считаем их только если хотя бы одному
+      // активному репортеру они действительно нужны (см. ReportersAggregator).
+      var metricCalculationRequired = aggregator.isMetricCalculationRequired();
+
       List<FileInfo> fileInfos;
       if (silentMode) {
         fileInfos = cliExecutor.submit(() ->
           filesToAnalyze.parallelStream()
-            .map((File file) -> getFileInfoFromFile(workspaceDir, file))
+            .map((File file) -> getFileInfoFromFile(workspaceDir, file, metricCalculationRequired))
             .toList()
         ).get();
       } else {
@@ -219,7 +226,7 @@ public class AnalyzeCommand implements Callable<Integer> {
             filesToAnalyze.parallelStream()
               .map((File file) -> {
                 pb.step();
-                return getFileInfoFromFile(workspaceDir, file);
+                return getFileInfoFromFile(workspaceDir, file, metricCalculationRequired);
               })
               .toList()
           ).get();
@@ -278,18 +285,28 @@ public class AnalyzeCommand implements Callable<Integer> {
     return reportersOptions.clone();
   }
 
-  private FileInfo getFileInfoFromFile(Path srcDir, File file) {
+  private FileInfo getFileInfoFromFile(Path srcDir, File file, boolean metricCalculationRequired) {
     var documentContext = serverContext.addDocument(Absolute.uri(file));
     serverContext.rebuildDocument(documentContext);
 
     var filePath = srcDir.relativize(Absolute.path(file));
     var diagnostics = documentContext.getDiagnostics();
-    var metrics = documentContext.getMetrics();
+    var metrics = metricCalculationRequired ? documentContext.getMetrics() : null;
     var mdoRef = documentContext.getMdoRef();
 
     var fileInfo = new FileInfo(filePath, mdoRef, diagnostics, metrics);
 
     // clean up AST after diagnostic computing to free up RAM.
+    // Документ заморожен в populateContext: между populate и вычислением диагностик файл не
+    // меняется, поэтому заморозка бережёт уже построенные ленивые данные от очистки/пересчёта
+    // (флаг влияет только на очистку). Здесь все нужные чтения (getDiagnostics, getMdoRef и,
+    // при необходимости, getMetrics) уже выполнены и захвачены в FileInfo, документ дальше не
+    // используется — размораживаем
+    // ПЕРЕД финальной очисткой, чтобы tryClearDocument освободил вторичные данные
+    // (сложность/метрики/подавления), а не держал их на всю конфигурацию (см. issue #4248).
+    // Саму заморозку это не отменяет: разморозка только на финальном clear, оптимизация
+    // populate -> diagnostics не затрагивается.
+    documentContext.unfreezeComputedData();
     serverContext.tryClearDocument(documentContext);
 
     return fileInfo;

@@ -24,65 +24,59 @@ package com.github._1c_syntax.bsl.languageserver.types.registry;
 import com.github._1c_syntax.bsl.languageserver.context.FileType;
 import com.github._1c_syntax.bsl.context.api.ContextNames;
 import com.github._1c_syntax.bsl.context.api.Placeholder;
+import com.github._1c_syntax.bsl.languageserver.configuration.Language;
 import com.github._1c_syntax.bsl.languageserver.configuration.LanguageServerConfiguration;
 import com.github._1c_syntax.bsl.languageserver.context.ServerContext;
 import com.github._1c_syntax.bsl.languageserver.context.ServerContextProvider;
-import com.github._1c_syntax.bsl.languageserver.context.events.ServerContextPopulatedEvent;
+import com.github._1c_syntax.bsl.languageserver.events.WorkspaceAddedEvent;
 import com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceContextHolder;
 import com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceScope;
-import com.github._1c_syntax.bsl.mdclasses.CF;
 import com.github._1c_syntax.bsl.languageserver.types.model.BilingualString;
-import com.github._1c_syntax.bsl.languageserver.types.model.ParameterDescriptor;
-import com.github._1c_syntax.bsl.languageserver.types.model.SignatureDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor;
+import com.github._1c_syntax.bsl.languageserver.types.model.MemberKind;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberSource;
 import com.github._1c_syntax.bsl.languageserver.types.model.PlatformMetadata;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeRef;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeSet;
-import com.github._1c_syntax.bsl.mdo.AccountingRegister;
-import com.github._1c_syntax.bsl.mdo.AccumulationRegister;
 import com.github._1c_syntax.bsl.mdo.Attribute;
 import com.github._1c_syntax.bsl.mdo.AttributeOwner;
 import com.github._1c_syntax.bsl.mdo.CalculationRegister;
+import com.github._1c_syntax.bsl.mdo.Catalog;
 import com.github._1c_syntax.bsl.mdo.ChartOfAccounts;
 import com.github._1c_syntax.bsl.mdo.ChartOfCalculationTypes;
 import com.github._1c_syntax.bsl.mdo.CommonAttribute;
+import com.github._1c_syntax.bsl.mdo.DefinedType;
 import com.github._1c_syntax.bsl.mdo.DocumentJournal;
 import com.github._1c_syntax.bsl.mdo.Enum;
-import com.github._1c_syntax.bsl.mdo.HTTPService;
-import com.github._1c_syntax.bsl.mdo.IntegrationService;
-import com.github._1c_syntax.bsl.mdo.WebService;
-import com.github._1c_syntax.bsl.mdo.children.HTTPServiceMethod;
-import com.github._1c_syntax.bsl.mdo.children.IntegrationServiceChannel;
-import com.github._1c_syntax.bsl.mdo.children.WebServiceOperation;
-import com.github._1c_syntax.bsl.mdo.ExternalDataSource;
-import com.github._1c_syntax.bsl.mdo.InformationRegister;
 import com.github._1c_syntax.bsl.mdo.MD;
 import com.github._1c_syntax.bsl.mdo.MDObject;
 import com.github._1c_syntax.bsl.mdo.PredefinedDataOwner;
 import com.github._1c_syntax.bsl.mdo.TabularSectionOwner;
 import com.github._1c_syntax.bsl.mdo.children.PredefinedValue;
 import com.github._1c_syntax.bsl.mdo.children.StandardAttribute;
-import com.github._1c_syntax.bsl.mdo.support.TemplateType;
 import com.github._1c_syntax.bsl.types.MDOType;
 import com.github._1c_syntax.bsl.types.MultiName;
-import com.github._1c_syntax.bsl.types.ValueType;
-import com.github._1c_syntax.bsl.types.value.PrimitiveValueType;
+import com.github._1c_syntax.bsl.types.ValueTypeDescription;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.jspecify.annotations.Nullable;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.event.EventListener;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
+import org.springframework.core.task.AsyncTaskExecutor;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.stream.Collectors;
 
 /**
  * Регистрирует {@link com.github._1c_syntax.bsl.languageserver.types.model.ConfigurationType}
@@ -95,12 +89,38 @@ import java.util.stream.Collectors;
  * <p>
  * Расширение членов (реквизиты, табчасти, методы из ObjectModule/ManagerModule)
  * выполняется отдельным провайдером — {@code ConfigurationModuleMembersProvider}.
+ *
+ * <h2>Когда регистрируются типы</h2>
+ *
+ * Инвариант: типы должны быть зарегистрированы <b>до</b> построения первого дерева символов.
+ * Всё, что при построении дерева опирается на типы, считается один раз и кэшируется в дереве,
+ * поэтому запоздавшая регистрация результат уже не исправит — он останется неверным до
+ * следующей перестройки документа.
+ * <p>
+ * Регистрация идемпотентна и подписана на {@link WorkspaceAddedEvent}: к этому моменту
+ * {@code configurationRoot} у контекста уже установлен — {@code addWorkspace} подхватывает его
+ * из workspace-scoped конфигурации (см. {@code ServerContextProvider#addWorkspace}), поэтому
+ * вызывающему достаточно обновить конфигурацию до {@code addWorkspace}. Деревья символов на
+ * этот момент ещё не строились: в LSP публикация {@code .bsl}-файлов идёт только после
+ * клиентского {@code initialized}, в CLI/MCP наполнение контекста ({@code populateContext})
+ * выполняется уже после {@code addWorkspace}.
+ * <p>
+ * Порядок среди слушателей {@link WorkspaceAddedEvent} задан явно
+ * ({@link Ordered#HIGHEST_PRECEDENCE}): Spring вызывает их последовательно на одном потоке,
+ * а {@code OScriptLibraryIndex} делает полный обход дерева workspace'а (на больших проектах
+ * это секунды). От регистрации типов он не зависит, поэтому ждать его незачем.
  */
 @Component
 @WorkspaceScope
 @RequiredArgsConstructor
 @Slf4j
 public class ConfigurationTypesProvider {
+
+  /** Платформенный тип значения табличной части (в синтакс-помощнике имя с пробелом). */
+  private static final String TABULAR_SECTION_TYPE = "Табличная часть";
+
+  /** Платформенный тип строки табличной части. */
+  private static final String TABULAR_SECTION_ROW_TYPE = "Строка табличной части";
 
   /** MDOType'ы, для которых имеет смысл регистрировать менеджер-тип. */
   private static final Set<MDOType> MANAGER_TYPES = Set.of(
@@ -130,56 +150,121 @@ public class ConfigurationTypesProvider {
     MDOType.PALETTE_COLOR
   );
 
+  /**
+   * MDOType'ы, у которых есть и «объектная», и «ссылочная» обёртки
+   * ({@code СправочникОбъект.X} + {@code СправочникСсылка.X} / {@code ДокументОбъект.X} + ...).
+   */
+  private static final Set<MDOType> OBJECT_TYPES = EnumSet.of(
+    MDOType.CATALOG,
+    MDOType.DOCUMENT,
+    MDOType.CHART_OF_CHARACTERISTIC_TYPES,
+    MDOType.CHART_OF_ACCOUNTS,
+    MDOType.CHART_OF_CALCULATION_TYPES,
+    MDOType.BUSINESS_PROCESS,
+    MDOType.TASK,
+    MDOType.EXCHANGE_PLAN
+  );
+
+  /**
+   * MDOType'ы, у которых есть «объектная» обёртка ({@code ОтчётОбъект.X},
+   * {@code ОбработкаОбъект.X}), но НЕТ ссылочного типа (это не ссылочные объекты
+   * конфигурации). Их реквизиты — такие же члены объектного типа, как у справочника
+   * или документа, но ссылочный тип для них не регистрируем.
+   */
+  private static final Set<MDOType> OBJECT_ONLY_TYPES = EnumSet.of(
+    MDOType.REPORT,
+    MDOType.DATA_PROCESSOR
+  );
+
   private final TypeRegistry typeRegistry;
   private final ServerContextProvider serverContextProvider;
   private final GlobalScopeProvider globalScopeProvider;
   private final LanguageServerConfiguration configuration;
   private final MetadataCollectionSpecializer metadataCollectionSpecializer;
   private final ConfigurationGenericExpander genericExpander;
+  private final CatalogOwnerTypesRegistrar catalogOwnerTypes;
   private final ServiceModuleEventRegistrar serviceModuleEventRegistrar;
+  private final FormTypesProvider formTypesProvider;
+  private final XdtoTypesProvider xdtoTypesProvider;
+  private final FormDataTypesRegistrar formDataTypesRegistrar;
+  private final RegisterTypesRegistrar registerTypesRegistrar;
+  private final RecorderIndex recorderIndex;
+  @Qualifier("platformTypesWarmupExecutor")
+  private final AsyncTaskExecutor platformTypesWarmupExecutor;
 
   private final AtomicBoolean registered = new AtomicBoolean(false);
 
-
+  /**
+   * Регистрирует типы конфигурации текущего workspace'а (см. {@link #tryRegister()}).
+   *
+   * @param event событие добавления workspace'а.
+   */
   @EventListener
-  public void handleEvent(ServerContextPopulatedEvent event) {
+  @Order(Ordered.HIGHEST_PRECEDENCE)
+  public void handleEvent(WorkspaceAddedEvent event) {
     tryRegister();
   }
 
   /**
-   * Идемпотентная регистрация. Вызывается при заполнении ServerContext (после
-   * того как платформенные generic-типы загружены через {@code BslContextPlatformTypesProvider}
-   * — это критично для {@code registerFamilySpecializations}, который ищет
-   * generic'и по familyCore и без них пропускает специализации). Повторные
-   * вызовы — no-op.
+   * Регистрирует конфигурационные типы workspace'а, взятого из
+   * {@link WorkspaceContextHolder}, и события его служебных модулей.
+   * <p>
+   * Идемпотентно: фактическая регистрация выполняется не более одного раза на экземпляр,
+   * повторные вызовы — no-op. No-op также, если конфигурация workspace'а ещё пуста
+   * (у голого «безворкспейсного» контекста {@code configurationRoot == null}).
+   * <p>
+   * Побочный эффект помимо регистрации: форсирует инициализацию платформенных generic-типов
+   * ({@code TypeRegistry.bootstrap()}). Она нужна {@code registerFamilySpecializations},
+   * который ищет generic'и по familyCore и без них молча пропускает специализации, и
+   * выполняется на {@link #platformTypesWarmupExecutor} параллельно чтению конфигурации —
+   * это независимые источники. Собственный executor обязателен: воркеры общего
+   * {@code ForkJoinPool} в исполняемом fat-jar получают чужой {@code contextClassLoader},
+   * из-за чего загрузка встроенных JSON-описаний падает с {@code FileNotFoundException}.
+   *
+   * @return контекст сервера, если регистрация действительно выполнена; иначе {@code null}.
    */
   public @Nullable ServerContext tryRegister() {
     if (registered.get()) {
       return null;
     }
+    // workspaceUri установлен всегда: tryRegister зовётся только из обработчика
+    // WorkspaceAddedEvent, а событие публикуется под workspace-контекстом.
     var workspaceUri = WorkspaceContextHolder.get();
-    if (workspaceUri == null) {
-      return null;
-    }
     var serverContext = serverContextProvider.getAllContexts().get(workspaceUri);
-    if (serverContext == null || serverContext.getConfiguration().isEmpty()) {
+    if (serverContext == null) {
       return null;
     }
-    if (!registered.compareAndSet(false, true)) {
+
+    // Прогрев платформенных generic-типов запускаем параллельно чтению конфигурации
+    // (независимые источники) на выделенном executor'е — не на общем ForkJoinPool.
+    var platformTypesWarmup = CompletableFuture.runAsync(() -> {
+      try (var ignored = WorkspaceContextHolder.forUri(workspaceUri)) {
+        typeRegistry.ensureInitialized();
+      }
+    }, platformTypesWarmupExecutor).exceptionally((Throwable e) -> {
+      LOGGER.warn("Failed to warm up platform types for workspace {}", workspaceUri, e);
+      return null;
+    });
+
+    if (serverContext.getConfiguration().isEmpty() || !registered.compareAndSet(false, true)) {
       return null;
     }
     var children = serverContext.getConfiguration().getChildrenByMdoRef().values();
     LOGGER.debug("ConfigurationTypesProvider[{}]: registering {} MD objects",
       workspaceUri, children.size());
-    register(children);
+    platformTypesWarmup.join();
+    register(children, serverContext.getScriptVariantLanguage());
     serviceModuleEventRegistrar.register(children);
     return serverContext;
   }
 
-  private void register(Iterable<MD> children) {
+  private void register(Iterable<MD> children, Language projectLanguage) {
     Map<MDOType, List<MemberDescriptor>> collectionMembersByType = new HashMap<>();
 
     var commonAttributes = collectCommonAttributes(children);
+    // «Регистр → его регистраторы» — только обходом документов: со стороны регистра
+    // этих данных в метаданных нет. Нужно до регистрации типов регистров.
+    recorderIndex.index(children);
     int count = 0;
     for (var md : children) {
       if (processMdoChild(md, commonAttributes, collectionMembersByType)) {
@@ -203,6 +288,14 @@ public class ConfigurationTypesProvider {
     // из bsl-context + развёртывание имён детей коллекции из mdclasses.
     metadataCollectionSpecializer.specialize();
 
+    // Тип на каждую форму: реквизиты, элементы, расширение по основному реквизиту
+    // и обработчики событий из Form.xml.
+    formTypesProvider.register(children, projectLanguage);
+
+    // Тип на каждый объектный тип XDTO-пакета: имя как в ссылке
+    // «См. XDTOПакет.<Пакет>.<Тип>», члены — свойства из схемы пакета.
+    xdtoTypesProvider.register(children);
+
     LOGGER.debug("Configuration types registered: {}, collection global properties: {}", count, collections);
   }
 
@@ -219,12 +312,22 @@ public class ConfigurationTypesProvider {
   /**
    * Обработка одного MD-объекта в {@link #register}: регистрация менеджера,
    * объектных/ссылочных типов, family-специализаций, expansion'ов для
-   * Enum/Journal/регистров, алиасов и member'а для namespace.
+   * Enum/Journal/регистров, алиасов и member'а для namespace. Определяемый тип
+   * вместо типа отдаёт реестру свой состав — типа у него нет.
    *
    * @return {@code true} если MD относится к {@link #MANAGER_TYPES} и был зарегистрирован.
    */
   private boolean processMdoChild(MD md, List<CommonAttribute> commonAttributes,
                                   Map<MDOType, List<MemberDescriptor>> collectionMembersByType) {
+    if (md instanceof DefinedType definedType) {
+      // За именем определяемого типа стоит набор, а не тип, поэтому реестру отдаётся
+      // состав. Реквизиты считаются лениво, уже после регистрации, — успеть до них
+      // достаточно здесь.
+      typeRegistry.registerDefinedType(
+        definedType.getMdoReference().getMdoRefRu(),
+        definedType.getValueType().getTypes().stream().map(type -> type.fullName().getRu()).toList());
+      return false;
+    }
     var mdoType = md.getMdoType();
     if (!MANAGER_TYPES.contains(mdoType)) {
       return false;
@@ -278,6 +381,9 @@ public class ConfigurationTypesProvider {
     }
     var familyCore = fullName.getRu();
     registerFamilySpecializations(familyCore, name);
+    registerTypesRegistrar.registerFamilyFixups(md, familyCore, name);
+    registerHierarchySuppressions(md, familyCore, name);
+    catalogOwnerTypes.registerOwnerMembers(md, familyCore, name);
     registerDerivedSpecializations(md, name);
     if (md instanceof DocumentJournal journal) {
       registerDocumentJournalColumnMembers(journal, familyCore, name);
@@ -288,9 +394,10 @@ public class ConfigurationTypesProvider {
     if (md instanceof PredefinedDataOwner predefinedDataOwner) {
       registerPredefinedValueExpansion(ref, familyCore, name, predefinedDataOwner);
     }
-    var registerChildren = registerChildrenOf(md);
+    var registerChildren = RegisterTypesRegistrar.registerChildrenOf(md);
     if (registerChildren != null) {
-      registerRegisterRecordExpansion(familyCore, name, registerChildren);
+      registerTypesRegistrar.registerRecordSetCollectionMembers(familyCore, name);
+      registerTypesRegistrar.registerRecordExpansion(familyCore, name, registerChildren);
     }
   }
 
@@ -343,32 +450,25 @@ public class ConfigurationTypesProvider {
     return collections;
   }
 
-  /** MDOType'ы, у которых есть «объектная» обёртка (СправочникОбъект.X / ДокументОбъект.X / ...). */
-  private static final Set<MDOType> OBJECT_TYPES = Set.of(
-    MDOType.CATALOG,
-    MDOType.DOCUMENT,
-    MDOType.CHART_OF_CHARACTERISTIC_TYPES,
-    MDOType.CHART_OF_ACCOUNTS,
-    MDOType.CHART_OF_CALCULATION_TYPES,
-    MDOType.BUSINESS_PROCESS,
-    MDOType.TASK,
-    MDOType.EXCHANGE_PLAN
-  );
-
   /**
-   * Зарегистрировать «объектную» и «ссылочную» обёртки метаобъекта (например,
-   * {@code СправочникОбъект.X}, {@code СправочникСсылка.X}) и навесить на них
-   * членов из реквизитов метаданных.
+   * Зарегистрировать «объектную» (и, для ссылочных объектов, «ссылочную») обёртку
+   * метаобъекта (например, {@code СправочникОбъект.X} + {@code СправочникСсылка.X};
+   * для отчёта/обработки — только {@code ОтчётОбъект.X}/{@code ОбработкаОбъект.X})
+   * и навесить на них членов из реквизитов метаданных и табличных частей.
    * <p>
-   * Сейчас обрабатываются только атрибуты (как PROPERTY). Табчасти — отдельная
-   * задача (требуют регистрации СправочникТабличнаяЧастьСтрока.X.Y типа).
+   * Реквизиты (включая стандартные) регистрируются как PROPERTY; табличные части —
+   * см. {@link #registerTabularSections}. Object-only типы (отчёт/обработка)
+   * получают только объектную обёртку — ссылочного типа у них нет.
    */
   private void registerObjectAndRefTypes(MD md,
                                          MDOType mdoType,
                                          String name,
                                          MultiName fullName,
                                          List<CommonAttribute> commonAttributes) {
-    if (!OBJECT_TYPES.contains(mdoType)) {
+    var hasRefType = OBJECT_TYPES.contains(mdoType);
+    // Отчёт/обработка: объектная обёртка есть, ссылочного типа нет — их реквизиты
+    // регистрируем как члены объектного типа, но без Ссылка-обёртки.
+    if (!hasRefType && !OBJECT_ONLY_TYPES.contains(mdoType)) {
       return;
     }
     var fullRu = fullName.getRu();
@@ -397,6 +497,47 @@ public class ConfigurationTypesProvider {
     var objectEn = fullEn.isBlank() ? "" : (fullEn + "Object." + name);
     var objectRef = registerWithAlias(objectRu, objectEn);
 
+    // Объектный тип есть у всех обрабатываемых здесь MDOType (в т.ч. object-only
+    // отчёта/обработки): его реквизиты — члены этого типа.
+    MemberSource objectSource = () -> {
+      var fresh = new ArrayList<MemberDescriptor>();
+      fresh.addAll(buildAttributeMembers(capturedAttributes,
+        collectPlatformMemberDescriptions(capturedFullRu),
+        collectPlatformMemberMetadata(capturedFullRu + "Объект")));
+      fresh.addAll(buildCommonAttributeMembers(capturedCommon));
+      return fresh;
+    };
+    typeRegistry.registerMemberSource(objectRef, objectSource, FileType.BSL);
+
+    // Ссылочный тип и связанные с ним источники — только для ссылочных объектов
+    // (отчёт/обработка ссылочного типа не имеют).
+    if (hasRefType) {
+      registerRefType(md, name, fullName, objectRef, capturedAttributes, capturedCommon);
+    }
+
+    // Табличные части: регистрируем пару типов <prefix>ТабличнаяЧасть(Строка)?.<MD>.<TS>
+    // и добавляем member <TS-name> на объектный тип.
+    registerTabularSections(md, name, fullRu, fullEn, objectRef);
+  }
+
+  /**
+   * Регистрирует «ссылочную» обёртку метаобъекта ({@code СправочникСсылка.X}), её
+   * singular-алиас ({@code Справочник.X}) и источник членов из тех же реквизитов, что и
+   * у объектной обёртки, но с метаданными ссылочного семейства.
+   * <p>
+   * Метаданные берутся раздельно по семействам, потому что у platform-generic'ов Object и Ref
+   * на одних и тех же стандартных реквизитах разные accessMode (например, Дата мутабельна на
+   * объекте и read-only на ссылке); описания при этом общие.
+   */
+  private void registerRefType(MD md,
+                               String name,
+                               MultiName fullName,
+                               TypeRef objectRef,
+                               List<? extends Attribute> attributes,
+                               List<CommonAttribute> commonAttributes) {
+    var fullRu = fullName.getRu();
+    var fullEn = fullName.getEn();
+
     var refRu = fullRu + "Ссылка." + name;
     var refEn = fullEn.isBlank() ? "" : fullEn + "Ref." + name;
     var refRef = registerWithAlias(refRu, refEn);
@@ -415,37 +556,19 @@ public class ConfigurationTypesProvider {
       }
     }
 
-    // У platform-generic'ов Object и Ref на одних и тех же стандартных
-    // реквизитах разные accessMode (например, Дата мутабельна на Объекте,
-    // но read-only на Ссылке). Поэтому собираем метаданные раздельно по
-    // семействам и регистрируем разные MemberSource'ы — описания общие
-    // и шарятся через collectPlatformMemberDescriptions.
     MemberSource refSource = () -> {
       var fresh = new ArrayList<MemberDescriptor>();
-      fresh.addAll(buildAttributeMembers(capturedAttributes,
-        collectPlatformMemberDescriptions(capturedFullRu),
-        collectPlatformMemberMetadata(capturedFullRu + "Ссылка")));
-      fresh.addAll(buildCommonAttributeMembers(capturedCommon));
+      fresh.addAll(buildAttributeMembers(attributes,
+        collectPlatformMemberDescriptions(fullRu),
+        collectPlatformMemberMetadata(fullRu + "Ссылка")));
+      fresh.addAll(buildCommonAttributeMembers(commonAttributes));
       return fresh;
     };
-    MemberSource objectSource = () -> {
-      var fresh = new ArrayList<MemberDescriptor>();
-      fresh.addAll(buildAttributeMembers(capturedAttributes,
-        collectPlatformMemberDescriptions(capturedFullRu),
-        collectPlatformMemberMetadata(capturedFullRu + "Объект")));
-      fresh.addAll(buildCommonAttributeMembers(capturedCommon));
-      return fresh;
-    };
-    typeRegistry.registerMemberSource(objectRef, objectSource, FileType.BSL);
     typeRegistry.registerMemberSource(refRef, refSource, FileType.BSL);
 
     // Дополнительные mdclasses-specific аттрибуты, не входящие в getAllAttributes:
     // признаки учёта и флаги учёта субконто для плана счетов.
     registerMdoSpecificAttributeMembers(md, objectRef, refRef);
-
-    // Табличные части: регистрируем пару типов <prefix>ТабличнаяЧасть(Строка)?.<MD>.<TS>
-    // и добавляем member <TS-name> на объектный тип.
-    registerTabularSections(md, name, fullRu, fullEn, objectRef);
   }
 
   /**
@@ -513,16 +636,20 @@ public class ConfigurationTypesProvider {
       var collRef = registerWithAlias(collRu, collEn);
 
       var tsAttributes = ts.getAttributes();
+      // Аналогично основным реквизитам: лямбда вызывает buildAttributeMembers
+      // на каждый getMembers, поэтому язык читается per-call и подхватывает
+      // workspace/didChangeConfiguration.
+      MemberSource columnSource = () -> buildAttributeMembers(tsAttributes);
       if (!tsAttributes.isEmpty()) {
-        // Аналогично основным реквизитам: лямбда вызывает buildAttributeMembers
-        // на каждый getMembers, поэтому язык читается per-call и подхватывает
-        // workspace/didChangeConfiguration.
-        MemberSource columnSource = () -> buildAttributeMembers(tsAttributes);
+        // Колонки — только у строки: у самой табличной части их нет, обращение
+        // `ТЧ.Цена` в 1С не работает.
         typeRegistry.registerMemberSource(rowRef, columnSource, FileType.BSL);
-        // Для удобства dot-completion'а ТЧ-коллекция тоже показывает колонки —
-        // обращение `ТЧ.Колонка` к коллекции встречается в коде (через индекс/первую строку).
-        typeRegistry.registerMemberSource(collRef, columnSource, FileType.BSL);
       }
+      registerTabularSectionPlatformMembers(rowRef, collRef, columnSource);
+      // Зеркало табличной части для управляемых форм заводится здесь, а не при
+      // регистрации формы: колонки уже под рукой, а форма узнаёт о табличных частях
+      // только из членов объектного типа — читать их из её ленивого источника нельзя.
+      formDataTypesRegistrar.registerTabularSectionData(collRef, columnSource);
 
       tsMembers.add(MemberDescriptor.property(tsName, collRef));
     }
@@ -530,6 +657,38 @@ public class ConfigurationTypesProvider {
       var immutableTs = List.copyOf(tsMembers);
       typeRegistry.registerMemberSource(objectRef, () -> immutableTs, FileType.BSL);
     }
+  }
+
+  /**
+   * Подмешивает табличной части и её строке платформенную часть: методы коллекции
+   * ({@code Добавить}, {@code НайтиСтроки}, {@code Выгрузить} …), обход
+   * {@code Для Каждого}, индексатор и {@code НомерСтроки} у строки.
+   * <p>
+   * Типы возврата при этом уточняются под строку <b>этой</b> табличной части: у
+   * платформенного описания они обобщённые, и без уточнения цепочка обрывалась бы на
+   * первом же вызове (см. {@link CollectionReturnsSpecializer}). Тип элемента коллекции
+   * задаётся до наследования коллекционных свойств — иначе выиграла бы унаследованная
+   * обобщённая строка и {@code Для Каждого} потерял бы колонки.
+   *
+   * @param rowRef  тип строки этой табличной части.
+   * @param collRef тип этой табличной части.
+   * @param columns источник её колонок.
+   */
+  private void registerTabularSectionPlatformMembers(TypeRef rowRef, TypeRef collRef, MemberSource columns) {
+    var genericColl = typeRegistry.resolve(TABULAR_SECTION_TYPE).orElse(null);
+    var genericRow = typeRegistry.resolve(TABULAR_SECTION_ROW_TYPE).orElse(null);
+    if (genericColl == null || genericRow == null) {
+      return;
+    }
+    typeRegistry.registerExtension(rowRef, genericRow, FileType.BSL);
+    typeRegistry.registerExtension(collRef, genericColl, FileType.BSL);
+    typeRegistry.registerDefaultElementTypes(collRef, List.of(rowRef));
+    typeRegistry.inheritCollectionTraits(collRef, genericColl, FileType.BSL);
+
+    var valueTableRow = typeRegistry.resolve(CollectionReturnsSpecializer.VALUE_TABLE_ROW).orElse(null);
+    typeRegistry.registerMemberOverride(collRef, () -> CollectionReturnsSpecializer.specialize(
+      typeRegistry.getMembers(genericColl, FileType.BSL), genericRow, rowRef,
+      CollectionReturnsSpecializer.unloadedRow(valueTableRow, columns)), FileType.BSL);
   }
 
   /**
@@ -546,7 +705,6 @@ public class ConfigurationTypesProvider {
       return typeRegistry.getMembers(parent, FileType.BSL);
     }, FileType.BSL);
   }
-
   /**
    * Регистрирует специализации ВСЕХ зарегистрированных дженериков семейства
    * (с qualifiedName, начинающимся с {@code familyCore}) для конкретного
@@ -566,6 +724,32 @@ public class ConfigurationTypesProvider {
         genericExpander.registerFamilySpecializations(familyCore,
           Map.of(parameters.get(0), mdName));
       }
+    }
+  }
+
+  /**
+   * Убирает реквизиты иерархии там, где их не существует: у неиерархического справочника
+   * нет ни {@code Родитель}, ни {@code ЭтоГруппа}, а при иерархии элементов нет
+   * {@code ЭтоГруппа}.
+   * <p>
+   * Платформа объявляет их у всего семейства сразу, поэтому перекрыть их нечем — член
+   * приходится именно убирать (см. {@link TypeRegistry#registerMemberSuppression}).
+   * Подавление вешается на все типы семейства: где реквизита и так нет, оно безвредно.
+   */
+  private void registerHierarchySuppressions(MD md, String familyCore, String mdName) {
+    var absent = StandardAttributesResolver.hierarchyAttributesAbsentIn(md);
+    if (absent.isEmpty()) {
+      return;
+    }
+    for (var generic : typeRegistry.findAllGenericsByFamilyCore(familyCore)) {
+      var parameters = typeRegistry.getTypeParameters(generic);
+      if (parameters.size() != 1) {
+        continue;
+      }
+      var bindings = Map.of(parameters.get(0), mdName);
+      typeRegistry.resolve(TypeRef.specialize(generic, bindings).qualifiedName())
+        .filter(specialized -> !specialized.equals(generic))
+        .ifPresent(specialized -> typeRegistry.registerMemberSuppression(specialized, absent, FileType.BSL));
     }
   }
 
@@ -660,66 +844,6 @@ public class ConfigurationTypesProvider {
   }
 
   /**
-   * Триплет имён детей регистра (измерения/ресурсы/реквизиты), полученный
-   * из конкретного MD-класса регистра. {@code null} — для не-регистров.
-   */
-  record RegisterChildren(List<? extends Attribute> dimensions,
-                          List<? extends Attribute> resources,
-                          List<? extends Attribute> attributes) {
-  }
-
-  static @Nullable RegisterChildren registerChildrenOf(MD md) {
-    return switch (md) {
-      case InformationRegister r ->
-        new RegisterChildren(r.getDimensions(), r.getResources(), r.getAttributes());
-      case AccumulationRegister r ->
-        new RegisterChildren(r.getDimensions(), r.getResources(), r.getAttributes());
-      case AccountingRegister r ->
-        new RegisterChildren(r.getDimensions(), r.getResources(), r.getAttributes());
-      case CalculationRegister r ->
-        new RegisterChildren(r.getDimensions(), r.getResources(), r.getAttributes());
-      default -> null;
-    };
-  }
-
-  /**
-   * Регистрирует expansion generic-property {@code <Имя измерения>/<Имя ресурса>/
-   * <Имя реквизита>} на типе записи регистра ({@code РегистрСведенийЗапись.<Имя>}
-   * и аналоги для других семейств регистров). Имена детей берутся из mdclasses;
-   * мета — наследуется от HBK-template'ов.
-   *
-   * @param familyCore ru-часть имени семейства ({@code "РегистрСведений"} и т.п.)
-   * @param regName    имя регистра в конфигурации
-   * @param children   измерения/ресурсы/реквизиты регистра
-   */
-  private void registerRegisterRecordExpansion(String familyCore, String regName, RegisterChildren children) {
-    var generic = typeRegistry.findAllGenericsByFamilyCore(familyCore + "Запись").stream()
-      .findFirst()
-      .orElse(null);
-    if (generic == null) {
-      return;
-    }
-    var parameters = typeRegistry.getTypeParameters(generic);
-    if (parameters.size() != 1) {
-      return;
-    }
-    var typeBindings = Map.of(parameters.get(0), regName);
-    var specializedName = TypeRef.specialize(generic, typeBindings).qualifiedName();
-    var specialized = typeRegistry.resolve(specializedName).orElse(null);
-    if (specialized == null) {
-      return;
-    }
-    var expansions = new LinkedHashMap<String, List<String>>();
-    putAttributeNames(expansions, "Имя измерения", children.dimensions());
-    putAttributeNames(expansions, "Имя ресурса", children.resources());
-    putAttributeNames(expansions, "Имя реквизита", children.attributes());
-    if (expansions.isEmpty()) {
-      return;
-    }
-    typeRegistry.registerMemberExpansion(specialized, generic, typeBindings, expansions, FileType.BSL);
-  }
-
-  /**
    * Графы журнала документов как property-члены на типе журнала
    * ({@code ЖурналДокументов.<имя>}). Источник имён и типов — mdclasses
    * ({@link DocumentJournal#getColumns()}); все колонки реализуют
@@ -766,18 +890,6 @@ public class ConfigurationTypesProvider {
     }
   }
 
-  /** Кладёт в expansion-map имена непустых атрибутов под ключом-placeholder'ом. */
-  static void putAttributeNames(Map<String, List<String>> sink, String placeholder,
-                                List<? extends Attribute> attributes) {
-    var names = attributes.stream()
-      .map(Attribute::getName)
-      .filter(n -> !n.isBlank())
-      .toList();
-    if (!names.isEmpty()) {
-      sink.put(placeholder, names);
-    }
-  }
-
   /**
    * Имя placeholder'а в member-template'е generic'а. Извлекается из единственного
    * generic-property типа-менеджера (для {@code ПеречислениеМенеджер.<Имя перечисления>}
@@ -817,6 +929,12 @@ public class ConfigurationTypesProvider {
       var description = platformDescriptions.getOrDefault(lc, BilingualString.EMPTY);
       var meta = platformMetadata.getOrDefault(lc, PlatformMetadata.EMPTY);
       var returnTypes = resolveAttributeReturnTypes(attribute);
+      if (returnTypes.isEmpty() && attribute instanceof StandardAttribute) {
+        // Стандартный реквизит платформа объявляет сама — с типом, описанием и мета.
+        // mdclasses про его тип знает не всегда (у `Владелец` типа нет вовсе), и
+        // бестиповый дубль отсюда только перекрыл бы объявление платформы.
+        continue;
+      }
       var primaryName = bilingualName.primary();
       MemberDescriptor descriptor;
       if (returnTypes.isEmpty()) {
@@ -955,18 +1073,7 @@ public class ConfigurationTypesProvider {
   }
 
   private TypeSet resolveCommonAttributeReturnTypes(CommonAttribute ca) {
-    var valueType = ca.getValueType();
-    if (valueType.isEmpty()) {
-      return TypeSet.EMPTY;
-    }
-    var refs = new java.util.LinkedHashSet<TypeRef>();
-    for (var vt : valueType.getTypes()) {
-      var resolved = resolveValueType(vt);
-      if (resolved != null) {
-        refs.add(resolved);
-      }
-    }
-    return refs.isEmpty() ? TypeSet.EMPTY : TypeSet.of(refs);
+    return ValueTypes.resolve(typeRegistry, ca.getValueType());
   }
 
   /**
@@ -1009,27 +1116,6 @@ public class ConfigurationTypesProvider {
    * composite-типа из нескольких {@code v8:Type}).
    */
   private TypeSet resolveAttributeReturnTypes(Attribute attribute) {
-    var valueType = attribute.getValueType();
-    if (valueType.isEmpty()) {
-      return TypeSet.EMPTY;
-    }
-    var refs = new java.util.LinkedHashSet<TypeRef>();
-    for (var vt : valueType.getTypes()) {
-      var resolved = resolveValueType(vt);
-      if (resolved != null) {
-        refs.add(resolved);
-      }
-    }
-    return refs.isEmpty() ? TypeSet.EMPTY : TypeSet.of(refs);
-  }
-
-  @Nullable
-  private TypeRef resolveValueType(ValueType vt) {
-    if (vt instanceof PrimitiveValueType primitive) {
-      return typeRegistry.resolve(primitive.fullName().getRu()).orElse(null);
-    }
-    // V8 / METADATA / UNKNOWN — пока не поддерживаем точно; resolve по имени даст
-    // частичное покрытие для V8-типов, имена которых совпадают с регистрационными.
-    return typeRegistry.resolve(vt.fullName().getRu()).orElse(null);
+    return ValueTypes.resolve(typeRegistry, attribute.getValueType());
   }
 }

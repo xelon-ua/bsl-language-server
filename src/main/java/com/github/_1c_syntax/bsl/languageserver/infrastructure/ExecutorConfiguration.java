@@ -35,6 +35,11 @@ import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinWorkerThread;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Конфигурация исполнителей для обработки асинхронных задач.
@@ -43,6 +48,7 @@ import java.util.concurrent.ForkJoinWorkerThread;
  * per-workspace — каждый воркспейс получает свой набор пулов. Worker threads
  * устанавливают workspace URI в ThreadLocal при старте ({@code onStart()}),
  * что гарантирует корректную работу workspace-scoped proxy в fork-задачах.
+ * Там же воркер получает своё имя — до регистрации в пуле его индекс ещё не известен.
  * <p>
  * Исключение: {@code computeConfigurationExecutor} — singleton, т.к. вызывает
  * внешнюю библиотеку MDClasses, не использующую ThreadLocal из BSL LS.
@@ -86,6 +92,11 @@ public class ExecutorConfiguration {
   }
 
   @Bean
+  public AsyncTaskExecutor platformTypesWarmupExecutor(TaskDecorator compositeTaskDecorator) {
+    return createVirtualThreadExecutor(compositeTaskDecorator, "platform-types-warmup-");
+  }
+
+  @Bean
   public AsyncTaskExecutor sentryExecutor(TaskDecorator compositeTaskDecorator) {
     return createVirtualThreadExecutor(compositeTaskDecorator, "sentry-");
   }
@@ -106,10 +117,15 @@ public class ExecutorConfiguration {
     return createSharedForkJoinExecutorService("compute-configuration-");
   }
 
+  // diagnosticComputerExecutor — обычный ThreadPoolExecutor, а не ForkJoinPool: диагностики одного
+  // документа сабмитятся отдельными задачами, а вызывающая сторона собирает результат через
+  // Future.get(). Блокировка на get() обычного пула не проходит через ForkJoinPool.managedBlock,
+  // поэтому вызов из воркера ForkJoinPool (пакетный analyze, анализ проекта при старте) не плодит
+  // компенсирующие потоки. Контекст workspace несёт ContextPropagatingExecutorService (per-task).
   @Bean(destroyMethod = "shutdown")
   @WorkspaceScope(proxyMode = ScopedProxyMode.INTERFACES)
   public ExecutorService diagnosticComputerExecutor() {
-    return createWorkspaceForkJoinPool("diagnostic-computer-");
+    return createWorkspaceExecutorService("diagnostic-computer-");
   }
 
   @Bean(destroyMethod = "shutdown")
@@ -150,37 +166,90 @@ public class ExecutorConfiguration {
     return new ContextPropagatingExecutorService(pool);
   }
 
+  private static ExecutorService createWorkspaceExecutorService(String prefix) {
+    var workspaceUri = WorkspaceContextHolder.get();
+    if (workspaceUri == null) {
+      throw new IllegalStateException("Workspace context is not set when creating executor");
+    }
+    var workspaceName = Optional.ofNullable(WorkspaceContextHolder.getName())
+      .orElse("default");
+    var parallelism = ForkJoinPool.getCommonPoolParallelism();
+    var factory = new NamedThreadFactory(prefix + workspaceName + "-");
+    var pool = new ThreadPoolExecutor(
+      parallelism, parallelism,
+      0L, TimeUnit.MILLISECONDS,
+      new LinkedBlockingQueue<>(),
+      factory
+    );
+    return new ContextPropagatingExecutorService(pool);
+  }
+
   private static ExecutorService createSharedForkJoinExecutorService(String threadNamePrefix) {
     var factory = new NamedForkJoinWorkerThreadFactory(threadNamePrefix);
     var pool = new ForkJoinPool(ForkJoinPool.getCommonPoolParallelism(), factory, null, true);
     return new ContextPropagatingExecutorService(pool);
   }
 
-  private record NamedForkJoinWorkerThreadFactory(String prefix) implements ForkJoinPool.ForkJoinWorkerThreadFactory {
+  private record NamedThreadFactory(String prefix, AtomicInteger index) implements ThreadFactory {
+    NamedThreadFactory(String prefix) {
+      this(prefix, new AtomicInteger());
+    }
+
     @Override
-    public ForkJoinWorkerThread newThread(ForkJoinPool pool) {
-      var thread = ForkJoinPool.defaultForkJoinWorkerThreadFactory.newThread(pool);
-      thread.setName(prefix + thread.getPoolIndex());
+    public Thread newThread(Runnable runnable) {
+      var thread = new Thread(runnable, prefix + index.getAndIncrement());
+      thread.setDaemon(true);
       return thread;
     }
   }
 
-  private record WorkspaceAwareFJWTFactory(
+  /**
+   * Фабрика воркеров ForkJoinPool, дающая каждому потоку имя вида {@code prefix + индекс воркера}.
+   * <p>
+   * Имя задаётся в {@code onStart()}, а не в {@code newThread()}: индекс присваивается воркеру при
+   * регистрации в пуле, которая происходит уже после конструктора потока, поэтому в {@code newThread()}
+   * метод {@code getPoolIndex()} вернул бы {@code 0} для всех воркеров сразу.
+   * <p>
+   * Воркер создаётся наследником {@link ForkJoinWorkerThread}, а не через
+   * {@code ForkJoinPool.defaultForkJoinWorkerThreadFactory}: та принудительно ставит потоку системный
+   * загрузчик классов, который в fat-jar не видит классы приложения. Здесь же context class loader
+   * наследуется от потока, спровоцировавшего создание воркера.
+   */
+  record NamedForkJoinWorkerThreadFactory(String prefix) implements ForkJoinPool.ForkJoinWorkerThreadFactory {
+    @Override
+    public ForkJoinWorkerThread newThread(ForkJoinPool pool) {
+      return new ForkJoinWorkerThread(pool) {
+        @Override
+        protected void onStart() {
+          super.onStart();
+          setName(prefix + getPoolIndex());
+        }
+      };
+    }
+  }
+
+  /**
+   * Фабрика воркеров per-workspace ForkJoinPool: при старте воркер запоминает свой workspace в
+   * {@link WorkspaceContextHolder} и получает имя вида
+   * {@code prefix + имя workspace + "-" + индекс воркера}.
+   * <p>
+   * О том, почему имя задаётся именно в {@code onStart()}, см. {@link NamedForkJoinWorkerThreadFactory}.
+   */
+  record WorkspaceAwareFJWTFactory(
     URI workspaceUri,
     String workspaceName,
     String prefix
   ) implements ForkJoinPool.ForkJoinWorkerThreadFactory {
     @Override
     public ForkJoinWorkerThread newThread(ForkJoinPool pool) {
-      var thread = new ForkJoinWorkerThread(pool) {
+      return new ForkJoinWorkerThread(pool) {
         @Override
         protected void onStart() {
           WorkspaceContextHolder.set(workspaceUri, workspaceName);
           super.onStart();
+          setName(prefix + workspaceName + "-" + getPoolIndex());
         }
       };
-      thread.setName(prefix + workspaceName + "-" + thread.getPoolIndex());
-      return thread;
     }
   }
 }

@@ -65,7 +65,6 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -109,7 +108,7 @@ public class GlobalScopeProvider {
    * {@code GlobalScopeProvider → TypeRegistry}, без цикла.
    */
   private final TypeRegistry typeRegistry;
-  /** Эпоха-кэшированный name-индекс членов GLOBAL_CONTEXT (см. {@link #globalMember}). */
+  /** Name-индекс членов GLOBAL_CONTEXT, кэшированный по наборам-источникам (см. {@link #globalMember}). */
   private final AtomicReference<GlobalIndex> globalIndexRef = new AtomicReference<>();
   /**
    * URI документа-модуля → его тип-значение (обратный индекс к name-keyed записям).
@@ -119,15 +118,15 @@ public class GlobalScopeProvider {
    * (у которого на руках URI, а не имя). Единая точка вместо обращения инференсера к
    * двум URI-ключевым индексам подсистем.
    */
-  private final Map<URI, TypeRef> moduleTypeByUri = new ConcurrentHashMap<>();
+  private final Map<URI, TypeRef> moduleTypeRefByUri = new ConcurrentHashMap<>();
   /**
-   * Обратный индекс к {@link #moduleTypeByUri}: тип-значение модуля → URI документа,
-   * объявившего этот тип. Заполняется синхронно вместе с {@link #moduleTypeByUri}
+   * Обратный индекс к {@link #moduleTypeRefByUri}: тип-значение модуля → URI документа,
+   * объявившего этот тип. Заполняется синхронно вместе с {@link #moduleTypeRefByUri}
    * (см. {@link #indexModuleType}/{@link #removeModuleType}). Используется навигацией
    * по типу к объявившему модулю (общий модуль, модуль менеджера объекта,
    * library-модуль OneScript) — у потребителя на руках {@link TypeRef}, а не URI.
    */
-  private final Map<TypeRef, URI> uriByModuleType = new ConcurrentHashMap<>();
+  private final Map<TypeRef, URI> uriByModuleTypeRef = new ConcurrentHashMap<>();
   /**
    * Каноничные «составные» имена MD-объектов конфигурации в коллекционной
    * форме ({@code Справочники.Контрагенты}, {@code Documents.Документ1}).
@@ -167,9 +166,10 @@ public class GlobalScopeProvider {
    * Резолв безпрефиксного имени в член глобальной области — синтетического типа
    * {@link TypeRegistry#GLOBAL_CONTEXT} (глобальная функция-метод либо глобальное
    * свойство: перечисление, менеджер коллекции, общий/library-модуль). Быстрый
-   * lookup по name-индексу, пересобираемому при смене эпохи членов
-   * ({@link TypeRegistry#membersEpoch()}). Единая абстракция доступа
-   * к глобальной области; {@link TypeRegistry} остаётся хранилищем типов.
+   * lookup по name-индексу, который пересобирается, когда {@code getMembers} отдаёт
+   * новые наборы членов {@code GLOBAL_CONTEXT} (то есть после любой их инвалидации).
+   * Единая абстракция доступа к глобальной области; {@link TypeRegistry} остаётся
+   * хранилищем типов.
    *
    * @param name     имя (регистронезависимо, ru/en).
    * @param fileType язык файла-потребителя.
@@ -179,13 +179,24 @@ public class GlobalScopeProvider {
     if (name == null || name.isBlank()) {
       return Optional.empty();
     }
-    var epoch = typeRegistry.membersEpoch();
+    // Индекс — производная от членов GLOBAL_CONTEXT, поэтому его актуальность определяется
+    // самими наборами-источниками: getMembers отдаёт тот же экземпляр списка, пока memo живо,
+    // и новый — после любой инвалидации (эпоха или пер-типовое поколение). Отдельный счётчик
+    // поколения индекса не нужен: сверки идентичности источников достаточно, и она же
+    // отбрасывает индекс, собранный параллельно из устаревших членов.
+    var bslSource = typeRegistry.getMembers(TypeRegistry.GLOBAL_CONTEXT, FileType.BSL);
+    var osSource = typeRegistry.getMembers(TypeRegistry.GLOBAL_CONTEXT, FileType.OS);
     var index = globalIndexRef.get();
-    if (index == null || index.epoch() != epoch) {
-      index = new GlobalIndex(epoch, Map.of(
-        FileType.BSL, globalNameIndex(FileType.BSL),
-        FileType.OS, globalNameIndex(FileType.OS)));
-      globalIndexRef.set(index);
+    if (index == null || index.bslSource() != bslSource || index.osSource() != osSource) {
+      var rebuilt = new GlobalIndex(bslSource, osSource, Map.of(
+        FileType.BSL, globalNameIndex(bslSource),
+        FileType.OS, globalNameIndex(osSource)));
+      // CAS, а не set: параллельный поток мог опубликовать индекс по более свежим наборам,
+      // и затирать его своим не нужно — иначе следующее чтение увидит рассинхрон и зря
+      // пересоберёт индекс. Собранный здесь экземпляр всё равно валиден для этого вызова:
+      // он построен ровно из тех наборов, которые мы прочитали выше.
+      globalIndexRef.compareAndSet(index, rebuilt);
+      index = rebuilt;
     }
     return Optional.ofNullable(index.byName().get(fileType).get(name.toLowerCase(Locale.ROOT)));
   }
@@ -250,9 +261,10 @@ public class GlobalScopeProvider {
     return result;
   }
 
-  private Map<String, MemberDescriptor> globalNameIndex(FileType fileType) {
-    var map = new HashMap<String, MemberDescriptor>();
-    for (var member : typeRegistry.getMembers(TypeRegistry.GLOBAL_CONTEXT, fileType)) {
+  private Map<String, MemberDescriptor> globalNameIndex(Collection<MemberDescriptor> members) {
+    // до двух записей на член (ru и en) — задаём ёмкость сразу, чтобы не рехэшировать
+    var map = HashMap.<String, MemberDescriptor>newHashMap(members.size() * 2);
+    for (var member : members) {
       var ru = member.bilingualName().ru();
       var en = member.bilingualName().en();
       if (!ru.isBlank()) {
@@ -265,8 +277,13 @@ public class GlobalScopeProvider {
     return map;
   }
 
-  /** Эпоха-кэшированный индекс имён членов GLOBAL_CONTEXT в разрезе языка. */
-  private record GlobalIndex(long epoch, Map<FileType, Map<String, MemberDescriptor>> byName) {
+  /**
+   * Индекс имён членов GLOBAL_CONTEXT в разрезе языка вместе с наборами-источниками,
+   * из которых он собран: сверка их идентичности и есть критерий актуальности индекса.
+   */
+  private record GlobalIndex(Collection<MemberDescriptor> bslSource,
+                             Collection<MemberDescriptor> osSource,
+                             Map<FileType, Map<String, MemberDescriptor>> byName) {
   }
 
   /**
@@ -397,22 +414,22 @@ public class GlobalScopeProvider {
    * же URI перезаписывает тип (корректно отражает переименование модуля).
    */
   public void indexModuleType(URI uri, TypeRef ref) {
-    var previous = moduleTypeByUri.put(uri, ref);
+    var previous = moduleTypeRefByUri.put(uri, ref);
     if (previous != null && !previous.equals(ref)) {
       // Тип модуля сменился (переименование): чистим устаревшую обратную запись,
       // только если она всё ещё указывает на этот же URI.
-      uriByModuleType.remove(previous, uri);
+      uriByModuleTypeRef.remove(previous, uri);
     }
-    uriByModuleType.put(ref, uri);
+    uriByModuleTypeRef.put(ref, uri);
   }
 
   /**
    * Снять связь URI→тип (при удалении документа/дерегистрации library-модуля).
    */
   public void removeModuleType(URI uri) {
-    var ref = moduleTypeByUri.remove(uri);
+    var ref = moduleTypeRefByUri.remove(uri);
     if (ref != null) {
-      uriByModuleType.remove(ref, uri);
+      uriByModuleTypeRef.remove(ref, uri);
     }
   }
 
@@ -420,13 +437,13 @@ public class GlobalScopeProvider {
    * Тип-значение модуля по URI документа. Используется выводом типа ресивера-модуля
    * ({@code ModuleSymbol}), у которого есть URI, но нет имени для name-keyed lookup'а.
    */
-  public Optional<TypeRef> moduleTypeByUri(URI uri) {
-    return Optional.ofNullable(moduleTypeByUri.get(uri));
+  public Optional<TypeRef> moduleTypeRefByUri(URI uri) {
+    return Optional.ofNullable(moduleTypeRefByUri.get(uri));
   }
 
   /**
    * URI документа-модуля, объявившего тип, по самому типу — обратная операция к
-   * {@link #moduleTypeByUri(URI)}. Используется навигацией по выведенному типу к
+   * {@link #moduleTypeRefByUri(URI)}. Используется навигацией по выведенному типу к
    * объявившему его модулю (общий модуль, модуль менеджера объекта конфигурации,
    * library-модуль OneScript).
    *
@@ -434,8 +451,8 @@ public class GlobalScopeProvider {
    * @return URI документа, объявившего тип, либо {@code empty}, если тип не модульный
    *   (не зарегистрирован через {@link #indexModuleType}).
    */
-  public Optional<URI> moduleUriByType(TypeRef ref) {
-    return Optional.ofNullable(uriByModuleType.get(ref));
+  public Optional<URI> uriByModuleTypeRef(TypeRef ref) {
+    return Optional.ofNullable(uriByModuleTypeRef.get(ref));
   }
 
 

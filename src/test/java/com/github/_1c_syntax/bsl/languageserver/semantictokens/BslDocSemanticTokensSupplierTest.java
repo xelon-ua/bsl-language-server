@@ -229,27 +229,45 @@ class BslDocSemanticTokensSupplierTest {
 
   @Test
   void testElementsInDescriptionStartingAtNonZeroColumn() {
-    // given - описание, начинающееся не с начала строки (висячий/trailing комментарий после Перем),
-    // который к тому же становится описанием следующего метода. Элементы (ключевые слова, типы)
-    // в первой строке такого описания должны подсвечиваться по своим реальным позициям,
-    // а не «съезжать» на величину отступа описания.
+    // given - описание с отступом, то есть начинающееся не с начала строки.
     String bsl = """
-      Перем П; // Параметры:
-      //  Парам - Строка - описание
-      Процедура Тест(Парам)
+          // Параметры:
+          //  Парам - Строка - описание
+          Процедура Тест(Парам)
+          КонецПроцедуры
+      """;
+
+    // when
+    var decoded = helper.getDecodedTokens(bsl, supplier);
+
+    // then: ключевое слово подсвечивается по своей реальной позиции — с учётом отступа
+    // (столбец 7 = четыре пробела, «//» и пробел), а не со столбца 3.
+    helper.assertContainsTokens(decoded, List.of(
+      new ExpectedToken(0, 7, 10, SemanticTokenTypes.Macro,
+        Set.of(SemanticTokenModifiers.Documentation), "Параметры:")
+    ));
+  }
+
+  @Test
+  void testTypeRefinedByHyperlinkHighlightsBothParts() {
+    // given - тип, уточнённый ссылкой: подсвечиваются и голова описания, и сама ссылка,
+    // ровно как подсвечивается отдельно стоящая ссылка.
+    String bsl = """
+      // Параметры:
+      //  Объект - СтрокаТабличнойЧасти: См. Справочник.Справочник1.ТабличнаяЧасть1
+      Процедура Тест(Объект)
       КонецПроцедуры
       """;
 
     // when
     var decoded = helper.getDecodedTokens(bsl, supplier);
 
-    // then - "Параметры:" подсвечивается на позиции 12 (а не 21 из-за двойного смещения),
-    // "Строка" на второй строке (со столбца 0) не затронута и остаётся на позиции 12.
+    // then
     helper.assertContainsTokens(decoded, List.of(
-      new ExpectedToken(0, 12, 10, SemanticTokenTypes.Macro,
-        Set.of(SemanticTokenModifiers.Documentation), "Параметры:"),
-      new ExpectedToken(1, 12, 6, SemanticTokenTypes.Type,
-        Set.of(SemanticTokenModifiers.Documentation), "Строка")
+      new ExpectedToken(1, 13, 20, SemanticTokenTypes.Type,
+        Set.of(SemanticTokenModifiers.Documentation), "СтрокаТабличнойЧасти"),
+      new ExpectedToken(1, 39, 38, SemanticTokenTypes.Type,
+        Set.of(SemanticTokenModifiers.Documentation), "Справочник.Справочник1.ТабличнаяЧасть1")
     ));
   }
 
@@ -314,6 +332,31 @@ class BslDocSemanticTokensSupplierTest {
       new ExpectedToken(1, 32, 6, SemanticTokenTypes.Type,
         Set.of(SemanticTokenModifiers.Documentation), "Массив"),
       new ExpectedToken(1, 42, 5, SemanticTokenTypes.Type,
+        Set.of(SemanticTokenModifiers.Documentation), "Число")
+    ));
+  }
+
+  @Test
+  void testMethodReturnCollectionTypeHighlighting() {
+    // given - описание возвращаемого значения метода с типом-коллекцией «Массив из Число».
+    // Парсер отдаёт TYPE_NAME-элементом только тип-голову (Массив), поэтому тип-значение (Число)
+    // подсвечивается из структурных аксессоров типов — иначе светилась бы только голова.
+    String bsl = """
+      // Возвращаемое значение:
+      //  Массив из Число - Массив тестовых чисел.
+      Функция ТестовыеЧисла() Экспорт
+      КонецФункции
+      """;
+
+    // when
+    var decoded = helper.getDecodedTokens(bsl, supplier);
+
+    // then - и «Массив», и «Число» подсвечены как тип; второй «Массив» (в тексте описания)
+    // и разделители остаются комментарием.
+    helper.assertContainsTokens(decoded, List.of(
+      new ExpectedToken(1, 4, 6, SemanticTokenTypes.Type,
+        Set.of(SemanticTokenModifiers.Documentation), "Массив"),
+      new ExpectedToken(1, 14, 5, SemanticTokenTypes.Type,
         Set.of(SemanticTokenModifiers.Documentation), "Число")
     ));
   }

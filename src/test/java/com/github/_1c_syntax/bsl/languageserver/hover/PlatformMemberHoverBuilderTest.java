@@ -35,7 +35,7 @@ import com.github._1c_syntax.bsl.languageserver.types.model.TypeKind;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeRef;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeSet;
 import com.github._1c_syntax.bsl.languageserver.types.registry.TypeRegistry;
-import com.github._1c_syntax.bsl.languageserver.utils.Resources;
+import com.github._1c_syntax.bsl.languageserver.configuration.Resources;
 import org.eclipse.lsp4j.MarkupKind;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -73,7 +73,8 @@ class PlatformMemberHoverBuilderTest {
 
   @BeforeEach
   void setUp() {
-    builder = new PlatformMemberHoverBuilder(resources, configuration, typeRegistry);
+    builder = new PlatformMemberHoverBuilder(resources, configuration, typeRegistry,
+      new PlatformMetadataRenderer(resources, configuration));
 
     when(configuration.getLanguage()).thenReturn(Language.RU);
 
@@ -82,8 +83,9 @@ class PlatformMemberHoverBuilderTest {
       .thenAnswer(inv -> ((TypeRef) inv.getArgument(0)).qualifiedName());
 
     // resources.getResourceString(clazz, key) → ключ как «значение» (для проверок
-    // через contains() на ключе; реальные ru-properties здесь не нужны).
-    lenient().when(resources.getResourceString(eq(PlatformMemberHoverBuilder.class), any(String.class)))
+    // через contains() на ключе; реальные ru-properties здесь не нужны). Стаб
+    // покрывает и сам билдер, и вынесенный PlatformMetadataRenderer.
+    lenient().when(resources.getResourceString(any(Class.class), any(String.class)))
       .thenAnswer(inv -> "[" + inv.getArgument(1) + "]");
   }
 

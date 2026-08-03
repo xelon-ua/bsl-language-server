@@ -25,11 +25,14 @@ import com.github._1c_syntax.bsl.languageserver.context.ServerContext;
 import com.github._1c_syntax.bsl.languageserver.context.ServerContextProvider;
 import com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceContextHolder;
 import com.github._1c_syntax.bsl.mdclasses.Configuration;
+import com.github._1c_syntax.bsl.mdclasses.Solution;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
 import java.net.URI;
 import java.util.List;
+
+import static org.mockito.Mockito.mock;
 
 /**
  * Покрытие early-return веток {@link ConfigurationGenericExpander} —
@@ -41,7 +44,7 @@ class ConfigurationGenericExpanderTest {
   void registerCommonLibraryExpansions_noWorkspace_noOp() {
     var serverProvider = Mockito.mock(ServerContextProvider.class);
     var registry = new TypeRegistry(List.of(),
-      Mockito.mock(MemberMetadataIndex.class));
+      mock(MemberMetadataIndex.class), mock(DefinedTypesIndex.class));
     var expander = new ConfigurationGenericExpander(registry, serverProvider);
     WorkspaceContextHolder.clear();
     expander.registerCommonLibraryExpansions();
@@ -57,7 +60,7 @@ class ConfigurationGenericExpanderTest {
       var serverProvider = Mockito.mock(ServerContextProvider.class);
       Mockito.when(serverProvider.getAllContexts()).thenReturn(java.util.Map.of());
       var registry = new TypeRegistry(List.of(),
-        Mockito.mock(MemberMetadataIndex.class));
+        mock(MemberMetadataIndex.class), mock(DefinedTypesIndex.class));
       var expander = new ConfigurationGenericExpander(registry, serverProvider);
       expander.registerCommonLibraryExpansions();
       Mockito.verify(serverProvider).getAllContexts();
@@ -76,11 +79,12 @@ class ConfigurationGenericExpanderTest {
       var configuration = Mockito.mock(Configuration.class);
       Mockito.when(configuration.isEmpty()).thenReturn(true);
       var serverContext = Mockito.mock(ServerContext.class);
-      Mockito.when(serverContext.getConfiguration()).thenReturn(configuration);
+      Mockito.when(serverContext.getConfiguration())
+        .thenReturn(Solution.builder().mergedConfiguration(configuration).build());
       var serverProvider = Mockito.mock(ServerContextProvider.class);
       Mockito.when(serverProvider.getAllContexts()).thenReturn(java.util.Map.of(workspaceUri, serverContext));
       var registry = new TypeRegistry(List.of(),
-        Mockito.mock(MemberMetadataIndex.class));
+        mock(MemberMetadataIndex.class), mock(DefinedTypesIndex.class));
       var expander = new ConfigurationGenericExpander(registry, serverProvider);
       expander.registerCommonLibraryExpansions();
       Mockito.verify(configuration).isEmpty();
@@ -93,7 +97,7 @@ class ConfigurationGenericExpanderTest {
   @Test
   void registerExternalDataSourceSpecializations_emptyBindings_noOp() {
     var registry = new TypeRegistry(List.of(),
-      Mockito.mock(MemberMetadataIndex.class));
+      mock(MemberMetadataIndex.class), mock(DefinedTypesIndex.class));
     var serverProvider = Mockito.mock(ServerContextProvider.class);
     var expander = new ConfigurationGenericExpander(registry, serverProvider);
     expander.registerFamilySpecializations("X", java.util.Map.of());
@@ -120,7 +124,7 @@ class ConfigurationGenericExpanderTest {
       .cube(goodCube)
       .build();
     var registry = new TypeRegistry(List.of(),
-      Mockito.mock(MemberMetadataIndex.class));
+      mock(MemberMetadataIndex.class), mock(DefinedTypesIndex.class));
     var serverProvider = Mockito.mock(ServerContextProvider.class);
     var expander = new ConfigurationGenericExpander(registry, serverProvider);
     expander.registerExternalDataSourceSpecializations(List.of(eds));

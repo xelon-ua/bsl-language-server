@@ -21,11 +21,11 @@
  */
 package com.github._1c_syntax.bsl.languageserver.providers;
 
-import com.github._1c_syntax.bsl.languageserver.ClientCapabilitiesHolder;
+import com.github._1c_syntax.bsl.languageserver.client.ClientCapabilitiesHolder;
 import com.github._1c_syntax.bsl.languageserver.configuration.Language;
 import com.github._1c_syntax.bsl.languageserver.configuration.LanguageServerConfiguration;
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
-import com.github._1c_syntax.bsl.languageserver.events.LanguageServerInitializeRequestReceivedEvent;
+import com.github._1c_syntax.bsl.languageserver.events.LanguageServerInitializedEvent;
 import com.github._1c_syntax.bsl.languageserver.types.TypeService;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberKind;
@@ -35,6 +35,7 @@ import com.github._1c_syntax.bsl.languageserver.types.model.TypeSet;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeRef;
 import com.github._1c_syntax.bsl.languageserver.types.registry.GlobalScopeProvider;
 import com.github._1c_syntax.bsl.languageserver.types.util.SignatureSelection;
+import com.github._1c_syntax.bsl.languageserver.utils.Positions;
 import com.github._1c_syntax.bsl.languageserver.utils.Ranges;
 import com.github._1c_syntax.bsl.parser.BSLParser;
 import lombok.RequiredArgsConstructor;
@@ -100,7 +101,7 @@ public final class SignatureHelpProvider {
   // documentation сигнатуры отдаётся как MarkupContent(MARKDOWN), иначе голой строкой (plaintext).
   private boolean markdownDocumentationSupport;
 
-  @EventListener(LanguageServerInitializeRequestReceivedEvent.class)
+  @EventListener(LanguageServerInitializedEvent.class)
   public void handleInitializeEvent() {
     var signatureInformation = clientCapabilitiesHolder.getCapabilities()
       .map(ClientCapabilities::getTextDocument)
@@ -281,7 +282,7 @@ public final class SignatureHelpProvider {
         continue;
       }
       var start = arg.getStart();
-      var position = new Position(start.getLine() - 1, start.getCharPositionInLine());
+      var position = Positions.create(start);
       result.add(typeService.expressionTypesAt(documentContext, position));
     }
     return result;
@@ -409,8 +410,14 @@ public final class SignatureHelpProvider {
     if (local.isPresent()) {
       return local;
     }
-    // Fallback: глобальная функция.
-    return globalScopeProvider.globalFunction(methodName, documentContext.getFileType());
+    // Глобальная функция.
+    var global = globalScopeProvider.globalFunction(methodName, documentContext.getFileType());
+    if (global.isPresent()) {
+      return global;
+    }
+    // Неквалифицированный вызов платформенного метода self-типа текущего
+    // модуля (тот же self-тип, что у dot-completion и hover).
+    return typeService.findSelfMember(documentContext, methodName, MemberKind.METHOD);
   }
 
   private Optional<MemberDescriptor> resolveAccessCall(
@@ -425,7 +432,7 @@ public final class SignatureHelpProvider {
     }
     // тип ресивера — по позиции имени метода
     var memberToken = mc.methodName().IDENTIFIER().getSymbol();
-    var memberPos = new Position(memberToken.getLine() - 1, memberToken.getCharPositionInLine());
+    var memberPos = Positions.create(memberToken);
     var typeSet = typeService.receiverTypesAt(documentContext, memberPos);
     for (TypeRef ref : typeSet.refs()) {
       for (var member : typeService.getMembers(ref, documentContext.getFileType())) {

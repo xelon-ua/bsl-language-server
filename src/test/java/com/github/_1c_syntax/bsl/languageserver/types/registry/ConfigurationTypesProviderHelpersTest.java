@@ -21,6 +21,13 @@
  */
 package com.github._1c_syntax.bsl.languageserver.types.registry;
 
+import com.github._1c_syntax.bsl.types.MdoReference;
+import com.github._1c_syntax.bsl.mdo.Report;
+import com.github._1c_syntax.bsl.mdo.PaletteColor;
+import com.github._1c_syntax.bsl.mdo.Enum;
+import com.github._1c_syntax.bsl.mdo.CommonAttribute;
+import com.github._1c_syntax.bsl.languageserver.types.model.TypeRef;
+import com.github._1c_syntax.bsl.languageserver.configuration.LanguageServerConfiguration;
 import com.github._1c_syntax.bsl.languageserver.context.FileType;
 import com.github._1c_syntax.bsl.languageserver.types.model.BilingualString;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor;
@@ -29,6 +36,7 @@ import com.github._1c_syntax.bsl.languageserver.context.ServerContext;
 import com.github._1c_syntax.bsl.languageserver.context.ServerContextProvider;
 import com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceContextHolder;
 import com.github._1c_syntax.bsl.mdclasses.Configuration;
+import com.github._1c_syntax.bsl.mdclasses.Solution;
 import com.github._1c_syntax.bsl.mdo.AccountingRegister;
 import com.github._1c_syntax.bsl.mdo.AccumulationRegister;
 import com.github._1c_syntax.bsl.mdo.CalculationRegister;
@@ -55,13 +63,16 @@ import com.github._1c_syntax.bsl.mdo.children.Resource;
 import com.github._1c_syntax.bsl.mdo.children.WebServiceOperation;
 import com.github._1c_syntax.bsl.mdo.children.WebServiceOperationParameter;
 import org.junit.jupiter.api.Test;
-import org.mockito.Mockito;
+import org.springframework.core.task.SimpleAsyncTaskExecutor;
 
-import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Unit-тесты на pure-static helpers {@link ConfigurationTypesProvider} —
@@ -69,91 +80,29 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class ConfigurationTypesProviderHelpersTest {
 
-  // === registerChildrenOf ===
-
-  @Test
-  void registerChildrenOf_informationRegister_returnsTriple() {
-    MD ir = InformationRegister.builder().name("РС1").build();
-    var children = ConfigurationTypesProvider.registerChildrenOf(ir);
-    assertThat(children).isNotNull();
-    assertThat(children.dimensions()).isNotNull();
-    assertThat(children.resources()).isNotNull();
-    assertThat(children.attributes()).isNotNull();
-  }
-
-  @Test
-  void registerChildrenOf_accumulationRegister_returnsTriple() {
-    MD r = AccumulationRegister.builder().name("РН1").build();
-    assertThat(ConfigurationTypesProvider.registerChildrenOf(r)).isNotNull();
-  }
-
-  @Test
-  void registerChildrenOf_accountingRegister_returnsTriple() {
-    MD r = AccountingRegister.builder().name("РБ1").build();
-    assertThat(ConfigurationTypesProvider.registerChildrenOf(r)).isNotNull();
-  }
-
-  @Test
-  void registerChildrenOf_calculationRegister_returnsTriple() {
-    MD r = CalculationRegister.builder().name("РР1").build();
-    assertThat(ConfigurationTypesProvider.registerChildrenOf(r)).isNotNull();
-  }
-
-  @Test
-  void registerChildrenOf_nonRegister_returnsNull() {
-    MD catalog = Catalog.builder().name("Контрагенты").build();
-    assertThat(ConfigurationTypesProvider.registerChildrenOf(catalog)).isNull();
-  }
-
-  // === putAttributeNames ===
-
-  @Test
-  void putAttributeNames_nonEmpty_putsKey() {
-    var attr = ObjectAttribute.builder().name("Контрагент").build();
-    var sink = new HashMap<String, List<String>>();
-    ConfigurationTypesProvider.putAttributeNames(sink, "Имя реквизита", List.of(attr));
-    assertThat(sink).containsKey("Имя реквизита");
-    assertThat(sink.get("Имя реквизита")).containsExactly("Контрагент");
-  }
-
-  @Test
-  void putAttributeNames_emptyList_doesNotPut() {
-    var sink = new HashMap<String, List<String>>();
-    ConfigurationTypesProvider.putAttributeNames(sink, "X", List.of());
-    assertThat(sink).isEmpty();
-  }
-
-  @Test
-  void putAttributeNames_blankNames_skipped() {
-    var blank = ObjectAttribute.builder().name("").build();
-    var named = ObjectAttribute.builder().name("Имя1").build();
-    var sink = new LinkedHashMap<String, List<String>>();
-    ConfigurationTypesProvider.putAttributeNames(sink, "K", List.of(blank, named));
-    assertThat(sink.get("K")).containsExactly("Имя1");
-  }
-
   // === tryRegister early returns (smoke без NPE) ===
 
   @Test
   void tryRegister_emptyConfiguration_isNoOp() {
     var workspaceUri = java.net.URI.create("file:///test-cfg2/");
-    com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceContextHolder
+    WorkspaceContextHolder
       .registerWorkspace(workspaceUri, "t");
-    com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceContextHolder.set(workspaceUri);
+    WorkspaceContextHolder.set(workspaceUri);
     try {
-      var configuration = Mockito.mock(com.github._1c_syntax.bsl.mdclasses.Configuration.class);
-      Mockito.when(configuration.isEmpty()).thenReturn(true);
-      var serverContext = Mockito.mock(com.github._1c_syntax.bsl.languageserver.context.ServerContext.class);
-      Mockito.when(serverContext.getConfiguration()).thenReturn(configuration);
-      var serverProvider = Mockito.mock(com.github._1c_syntax.bsl.languageserver.context.ServerContextProvider.class);
-      Mockito.when(serverProvider.getAllContexts()).thenReturn(java.util.Map.of(workspaceUri, serverContext));
+      var configuration = mock(Configuration.class);
+      when(configuration.isEmpty()).thenReturn(true);
+      var serverContext = mock(ServerContext.class);
+      when(serverContext.getConfiguration())
+        .thenReturn(Solution.builder().mergedConfiguration(configuration).build());
+      var serverProvider = mock(ServerContextProvider.class);
+      when(serverProvider.getAllContexts()).thenReturn(java.util.Map.of(workspaceUri, serverContext));
       var p = newProviderWith(serverProvider);
       p.tryRegister();
-      Mockito.verify(configuration).isEmpty();
-      Mockito.verify(configuration, Mockito.never()).getChildrenByMdoRef();
+      verify(configuration).isEmpty();
+      verify(configuration, never()).getChildrenByMdoRef();
     } finally {
-      com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceContextHolder.clear();
-      com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceContextHolder
+      WorkspaceContextHolder.clear();
+      WorkspaceContextHolder
         .unregisterWorkspace(workspaceUri);
     }
   }
@@ -161,36 +110,82 @@ class ConfigurationTypesProviderHelpersTest {
   @Test
   void tryRegister_withCatalogChild_registersConfigurationType() {
     var workspaceUri = java.net.URI.create("file:///test-cfg-cat/");
-    com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceContextHolder
+    WorkspaceContextHolder
       .registerWorkspace(workspaceUri, "t");
-    com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceContextHolder.set(workspaceUri);
-    try {
-      var catalog = (com.github._1c_syntax.bsl.mdo.MD)
-        com.github._1c_syntax.bsl.mdo.Catalog.builder().name("Контрагенты").build();
-      var configuration = Mockito.mock(com.github._1c_syntax.bsl.mdclasses.Configuration.class);
-      Mockito.when(configuration.isEmpty()).thenReturn(false);
-      Mockito.when(configuration.getChildrenByMdoRef())
+    try (var ignored = WorkspaceContextHolder
+      .forUri(workspaceUri)) {
+      var catalog = (MD)
+        Catalog.builder().name("Контрагенты").build();
+      var configuration = mock(Configuration.class);
+      when(configuration.isEmpty()).thenReturn(false);
+      when(configuration.getChildrenByMdoRef())
         .thenReturn(java.util.Map.of(catalog.getMdoReference(), catalog));
-      var serverContext = Mockito.mock(com.github._1c_syntax.bsl.languageserver.context.ServerContext.class);
-      Mockito.when(serverContext.getConfiguration()).thenReturn(configuration);
-      var serverProvider = Mockito.mock(com.github._1c_syntax.bsl.languageserver.context.ServerContextProvider.class);
-      Mockito.when(serverProvider.getAllContexts()).thenReturn(java.util.Map.of(workspaceUri, serverContext));
+      var serverContext = mock(ServerContext.class);
+      when(serverContext.getConfiguration())
+        .thenReturn(Solution.builder().mergedConfiguration(configuration).build());
+      var serverProvider = mock(ServerContextProvider.class);
+      when(serverProvider.getAllContexts()).thenReturn(java.util.Map.of(workspaceUri, serverContext));
 
       var registry = new TypeRegistry(List.of(),
-        Mockito.mock(MemberMetadataIndex.class));
-      var globalScope = Mockito.mock(GlobalScopeProvider.class);
-      var lsConfig = Mockito.mock(
-        com.github._1c_syntax.bsl.languageserver.configuration.LanguageServerConfiguration.class);
-      var mcs = Mockito.mock(MetadataCollectionSpecializer.class);
-      var provider = new ConfigurationTypesProvider(registry, serverProvider, globalScope, lsConfig, mcs, new ConfigurationGenericExpander(registry, serverProvider), new ServiceModuleEventRegistrar(registry));
+        mock(MemberMetadataIndex.class), mock(DefinedTypesIndex.class));
+      var globalScope = mock(GlobalScopeProvider.class);
+      var lsConfig = mock(
+        LanguageServerConfiguration.class);
+      var mcs = mock(MetadataCollectionSpecializer.class);
+      var provider = newProvider(registry, serverProvider, globalScope, lsConfig, mcs);
 
       provider.tryRegister();
       // ConfigurationType "СправочникМенеджер.Контрагенты" должен быть зарегистрирован.
       assertThat(registry.resolve("СправочникМенеджер.Контрагенты")).isPresent();
     } finally {
-      com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceContextHolder.clear();
-      com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceContextHolder
+      WorkspaceContextHolder
         .unregisterWorkspace(workspaceUri);
+    }
+  }
+
+  /**
+   * Отчёт (как и обработка) — object-only тип: объектная обёртка у него есть, а
+   * ссылочного типа нет. Раньше такие MDO целиком выпадали из
+   * {@code registerObjectAndRefTypes}, и члены их объектного типа (реквизиты,
+   * табличные части) не регистрировались нигде.
+   */
+  @Test
+  void tryRegister_withReportChild_registersObjectTypeWithoutRefType() {
+    var workspaceUri = java.net.URI.create("file:///test-cfg-report/");
+    WorkspaceContextHolder.registerWorkspace(workspaceUri, "t");
+    try (var ignored = WorkspaceContextHolder.forUri(workspaceUri)) {
+      var report = (MD) Report.builder().name("Продажи").build();
+      var configuration = mock(Configuration.class);
+      when(configuration.isEmpty()).thenReturn(false);
+      when(configuration.getChildrenByMdoRef())
+        .thenReturn(java.util.Map.of(report.getMdoReference(), report));
+      var serverContext = mock(
+        ServerContext.class);
+      when(serverContext.getConfiguration())
+        .thenReturn(Solution.builder().mergedConfiguration(configuration).build());
+      var serverProvider = mock(
+        ServerContextProvider.class);
+      when(serverProvider.getAllContexts()).thenReturn(java.util.Map.of(workspaceUri, serverContext));
+
+      var registry = new TypeRegistry(List.of(), mock(MemberMetadataIndex.class),
+        mock(DefinedTypesIndex.class));
+      var globalScope = mock(GlobalScopeProvider.class);
+      var lsConfig = mock(
+        LanguageServerConfiguration.class);
+      var mcs = mock(MetadataCollectionSpecializer.class);
+      var provider = newProvider(registry, serverProvider, globalScope, lsConfig, mcs);
+
+      provider.tryRegister();
+
+      var groupRu = report.getMdoType().fullName().getRu();
+      assertThat(registry.resolve(groupRu + "Объект.Продажи"))
+        .as("объектная обёртка отчёта нужна модулю объекта — её реквизиты это его члены")
+        .isPresent();
+      assertThat(registry.resolve(groupRu + "Ссылка.Продажи"))
+        .as("отчёт не ссылочный объект конфигурации — ссылочный тип регистрировать нельзя")
+        .isEmpty();
+    } finally {
+      WorkspaceContextHolder.unregisterWorkspace(workspaceUri);
     }
   }
 
@@ -198,33 +193,31 @@ class ConfigurationTypesProviderHelpersTest {
   void tryRegister_withPaletteColorChild_registersManager() {
     var workspaceUri = java.net.URI.create("file:///test-cfg-palette/");
     WorkspaceContextHolder.registerWorkspace(workspaceUri, "t");
-    WorkspaceContextHolder.set(workspaceUri);
-    try {
-      var paletteColor = (MD) com.github._1c_syntax.bsl.mdo.PaletteColor.builder()
+    try (var ignored = WorkspaceContextHolder.forUri(workspaceUri)) {
+      var paletteColor = (MD) PaletteColor.builder()
         .name("ПервичныйЦвет").build();
-      var configuration = Mockito.mock(Configuration.class);
-      Mockito.when(configuration.isEmpty()).thenReturn(false);
-      Mockito.when(configuration.getChildrenByMdoRef())
+      var configuration = mock(Configuration.class);
+      when(configuration.isEmpty()).thenReturn(false);
+      when(configuration.getChildrenByMdoRef())
         .thenReturn(java.util.Map.of(paletteColor.getMdoReference(), paletteColor));
-      var serverContext = Mockito.mock(ServerContext.class);
-      Mockito.when(serverContext.getConfiguration()).thenReturn(configuration);
-      var serverProvider = Mockito.mock(ServerContextProvider.class);
-      Mockito.when(serverProvider.getAllContexts())
+      var serverContext = mock(ServerContext.class);
+      when(serverContext.getConfiguration())
+        .thenReturn(Solution.builder().mergedConfiguration(configuration).build());
+      var serverProvider = mock(ServerContextProvider.class);
+      when(serverProvider.getAllContexts())
         .thenReturn(java.util.Map.of(workspaceUri, serverContext));
 
       var registry = new TypeRegistry(List.of(),
-        Mockito.mock(MemberMetadataIndex.class));
-      var globalScope = Mockito.mock(GlobalScopeProvider.class);
-      var lsConfig = Mockito.mock(
-        com.github._1c_syntax.bsl.languageserver.configuration.LanguageServerConfiguration.class);
-      var mcs = Mockito.mock(MetadataCollectionSpecializer.class);
-      var provider = new ConfigurationTypesProvider(registry, serverProvider, globalScope,
-        lsConfig, mcs, new ConfigurationGenericExpander(registry, serverProvider), new ServiceModuleEventRegistrar(registry));
+        mock(MemberMetadataIndex.class), mock(DefinedTypesIndex.class));
+      var globalScope = mock(GlobalScopeProvider.class);
+      var lsConfig = mock(
+        LanguageServerConfiguration.class);
+      var mcs = mock(MetadataCollectionSpecializer.class);
+      var provider = newProvider(registry, serverProvider, globalScope, lsConfig, mcs);
 
       provider.tryRegister();
       assertThat(registry.resolve("ЦветПалитрыМенеджер.ПервичныйЦвет")).isPresent();
     } finally {
-      WorkspaceContextHolder.clear();
       WorkspaceContextHolder.unregisterWorkspace(workspaceUri);
     }
   }
@@ -233,14 +226,13 @@ class ConfigurationTypesProviderHelpersTest {
   void tryRegister_withMultipleMdoTypes_registersAll() {
     var workspaceUri = java.net.URI.create("file:///test-cfg-all/");
     WorkspaceContextHolder.registerWorkspace(workspaceUri, "t");
-    WorkspaceContextHolder.set(workspaceUri);
-    try {
+    try (var ignored = WorkspaceContextHolder.forUri(workspaceUri)) {
       var enumValue = EnumValue.builder().name("Юридическое").build();
-      var children = new java.util.LinkedHashMap<com.github._1c_syntax.bsl.types.MdoReference, MD>();
+      var children = new java.util.LinkedHashMap<MdoReference, MD>();
       addMd(children, Catalog.builder().name("Контрагенты").build());
       addMd(children, Document.builder().name("ПродажиТоваров").build());
       addMd(children, DocumentJournal.builder().name("ОбщийЖурнал").build());
-      addMd(children, com.github._1c_syntax.bsl.mdo.Enum.builder().name("ВидыКонтрагента")
+      addMd(children, Enum.builder().name("ВидыКонтрагента")
         .enumValue(enumValue).build());
       addMd(children, InformationRegister.builder().name("Курсы").build());
       addMd(children, AccumulationRegister.builder().name("ОстаткиТоваров").build());
@@ -248,22 +240,23 @@ class ConfigurationTypesProviderHelpersTest {
       addMd(children, CalculationRegister.builder().name("Начисления").build());
       addMd(children, ChartOfAccounts.builder().name("Основной").build());
 
-      var configuration = Mockito.mock(Configuration.class);
-      Mockito.when(configuration.isEmpty()).thenReturn(false);
-      Mockito.when(configuration.getChildrenByMdoRef()).thenReturn(children);
-      var serverContext = Mockito.mock(ServerContext.class);
-      Mockito.when(serverContext.getConfiguration()).thenReturn(configuration);
-      var serverProvider = Mockito.mock(ServerContextProvider.class);
-      Mockito.when(serverProvider.getAllContexts())
+      var configuration = mock(Configuration.class);
+      when(configuration.isEmpty()).thenReturn(false);
+      when(configuration.getChildrenByMdoRef()).thenReturn(children);
+      var serverContext = mock(ServerContext.class);
+      when(serverContext.getConfiguration())
+        .thenReturn(Solution.builder().mergedConfiguration(configuration).build());
+      var serverProvider = mock(ServerContextProvider.class);
+      when(serverProvider.getAllContexts())
         .thenReturn(java.util.Map.of(workspaceUri, serverContext));
 
       var registry = new TypeRegistry(List.of(),
-        Mockito.mock(MemberMetadataIndex.class));
-      var globalScope = Mockito.mock(GlobalScopeProvider.class);
-      var lsConfig = Mockito.mock(
-        com.github._1c_syntax.bsl.languageserver.configuration.LanguageServerConfiguration.class);
-      var mcs = Mockito.mock(MetadataCollectionSpecializer.class);
-      var provider = new ConfigurationTypesProvider(registry, serverProvider, globalScope, lsConfig, mcs, new ConfigurationGenericExpander(registry, serverProvider), new ServiceModuleEventRegistrar(registry));
+        mock(MemberMetadataIndex.class), mock(DefinedTypesIndex.class));
+      var globalScope = mock(GlobalScopeProvider.class);
+      var lsConfig = mock(
+        LanguageServerConfiguration.class);
+      var mcs = mock(MetadataCollectionSpecializer.class);
+      var provider = newProvider(registry, serverProvider, globalScope, lsConfig, mcs);
 
       provider.tryRegister();
 
@@ -273,59 +266,87 @@ class ConfigurationTypesProviderHelpersTest {
       // и регистрации catalog'а (уже проверено в tryRegister_withCatalogChild).
       assertThat(registry).isNotNull();
     } finally {
-      WorkspaceContextHolder.clear();
       WorkspaceContextHolder.unregisterWorkspace(workspaceUri);
     }
   }
 
-  private static void addMd(java.util.Map<com.github._1c_syntax.bsl.types.MdoReference, MD> sink, MD md) {
+  private static void addMd(java.util.Map<MdoReference, MD> sink, MD md) {
     sink.put(md.getMdoReference(), md);
   }
 
   @Test
   void tryRegister_idempotent_secondCallNoOp() {
     var workspaceUri = java.net.URI.create("file:///test-cfg3/");
-    com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceContextHolder
+    WorkspaceContextHolder
       .registerWorkspace(workspaceUri, "t");
-    com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceContextHolder.set(workspaceUri);
+    WorkspaceContextHolder.set(workspaceUri);
     try {
-      var configuration = Mockito.mock(com.github._1c_syntax.bsl.mdclasses.Configuration.class);
-      Mockito.when(configuration.isEmpty()).thenReturn(false);
-      Mockito.when(configuration.getChildrenByMdoRef()).thenReturn(java.util.Map.of());
-      var serverContext = Mockito.mock(com.github._1c_syntax.bsl.languageserver.context.ServerContext.class);
-      Mockito.when(serverContext.getConfiguration()).thenReturn(configuration);
-      var serverProvider = Mockito.mock(com.github._1c_syntax.bsl.languageserver.context.ServerContextProvider.class);
-      Mockito.when(serverProvider.getAllContexts()).thenReturn(java.util.Map.of(workspaceUri, serverContext));
+      var configuration = mock(Configuration.class);
+      when(configuration.isEmpty()).thenReturn(false);
+      when(configuration.getChildrenByMdoRef()).thenReturn(java.util.Map.of());
+      var serverContext = mock(ServerContext.class);
+      when(serverContext.getConfiguration())
+        .thenReturn(Solution.builder().mergedConfiguration(configuration).build());
+      var serverProvider = mock(ServerContextProvider.class);
+      when(serverProvider.getAllContexts()).thenReturn(java.util.Map.of(workspaceUri, serverContext));
       var p = newProviderWith(serverProvider);
       p.tryRegister();
       p.tryRegister();
       // Идемпотентность: второй вызов раннее выходит и не читает children повторно.
-      Mockito.verify(configuration, Mockito.times(1)).getChildrenByMdoRef();
+      verify(configuration, times(1)).getChildrenByMdoRef();
     } finally {
-      com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceContextHolder.clear();
-      com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceContextHolder
+      WorkspaceContextHolder.clear();
+      WorkspaceContextHolder
         .unregisterWorkspace(workspaceUri);
     }
   }
 
   private static ConfigurationTypesProvider newProviderWith(
-      com.github._1c_syntax.bsl.languageserver.context.ServerContextProvider serverProvider) {
+      ServerContextProvider serverProvider) {
     var registry = new TypeRegistry(List.of(),
-      Mockito.mock(MemberMetadataIndex.class));
-    var globalScope = Mockito.mock(GlobalScopeProvider.class);
-    var lsConfig = Mockito.mock(
-      com.github._1c_syntax.bsl.languageserver.configuration.LanguageServerConfiguration.class);
-    var mcs = Mockito.mock(MetadataCollectionSpecializer.class);
+      mock(MemberMetadataIndex.class), mock(DefinedTypesIndex.class));
+    var globalScope = mock(GlobalScopeProvider.class);
+    var lsConfig = mock(
+      LanguageServerConfiguration.class);
+    var mcs = mock(MetadataCollectionSpecializer.class);
+    return newProvider(registry, serverProvider, globalScope, lsConfig, mcs);
+  }
+
+  /**
+   * Провайдер с настоящими коллабораторами поверх переданных моков. Индекс регистраторов
+   * общий с {@link RegisterTypesRegistrar}: провайдер его наполняет, регистратор читает.
+   */
+  private static ConfigurationTypesProvider newProvider(TypeRegistry registry,
+                                                        ServerContextProvider serverProvider,
+                                                        GlobalScopeProvider globalScope,
+                                                        LanguageServerConfiguration lsConfig,
+                                                        MetadataCollectionSpecializer mcs) {
+    var recorderIndex = new RecorderIndex();
+    var formDataTypesRegistrar = new FormDataTypesRegistrar(registry);
+    var typeFactory = new FormTypeFactory(registry);
+    var formParametersResolver =
+      new FormParametersResolver(new BslContextHolder(mock(PlatformContextProviderFactory.class)));
+    var formTypesProvider = new FormTypesProvider(registry, formParametersResolver, recorderIndex,
+      new FormHandlerRoleIndex(mock(EventHandlerResolver.class)), new FormAttributeTypeIndex(),
+      formDataTypesRegistrar,
+      new FormItemTypesRegistrar(registry, formDataTypesRegistrar, typeFactory), typeFactory,
+      new FormParametersRegistrar(registry, formParametersResolver, formDataTypesRegistrar, typeFactory,
+        recorderIndex),
+      new StructureParameterFieldsRegistrar(registry));
     return new ConfigurationTypesProvider(registry, serverProvider, globalScope, lsConfig, mcs,
-      new ConfigurationGenericExpander(registry, serverProvider), new ServiceModuleEventRegistrar(registry));
+      new ConfigurationGenericExpander(registry, serverProvider), new CatalogOwnerTypesRegistrar(registry),
+      new ServiceModuleEventRegistrar(registry),
+      formTypesProvider, new XdtoTypesProvider(registry), formDataTypesRegistrar,
+      new RegisterTypesRegistrar(registry, recorderIndex), recorderIndex,
+      new SimpleAsyncTaskExecutor());
   }
 
   // === memberPlaceholderName ===
 
   @Test
   void memberPlaceholderName_typeWithGenericMember_extractsPlaceholder() {
-    var memberIndex = Mockito.mock(MemberMetadataIndex.class);
-    var registry = new TypeRegistry(List.of(), memberIndex);
+    var memberIndex = mock(MemberMetadataIndex.class);
+    var registry = new TypeRegistry(List.of(), memberIndex, mock(DefinedTypesIndex.class));
     var ref = registry.registerConfigurationType("ПеречислениеМенеджер.X");
     var generic = MemberDescriptor.genericProperty("<Имя значения>",
         registry.registerConfigurationType("ПеречислениеСсылка.X"), "")
@@ -424,7 +445,7 @@ class ConfigurationTypesProviderHelpersTest {
 
   @Test
   void tryRegister_withEnumWithoutValues_earlyReturn() {
-    var emptyEnum = com.github._1c_syntax.bsl.mdo.Enum.builder().name("ПустоеПеречисление").build();
+    var emptyEnum = Enum.builder().name("ПустоеПеречисление").build();
     runTryRegister(
       "file:///test-enum-empty/",
       registry -> registry,
@@ -438,7 +459,7 @@ class ConfigurationTypesProviderHelpersTest {
 
   @Test
   void tryRegister_withEnumNoGenericTemplate_earlyReturn() {
-    var anEnum = com.github._1c_syntax.bsl.mdo.Enum.builder().name("ВидыКонтрагента")
+    var anEnum = Enum.builder().name("ВидыКонтрагента")
       .enumValue(EnumValue.builder().name("Юридическое").build()).build();
     runTryRegister(
       "file:///test-enum-no-template/",
@@ -453,11 +474,11 @@ class ConfigurationTypesProviderHelpersTest {
 
   @Test
   void tryRegister_withCommonAttribute_buildsApplicableMembers() {
-    var common = com.github._1c_syntax.bsl.mdo.CommonAttribute.builder()
+    var common = CommonAttribute.builder()
       .name("Организация").build();
     var doc = Document.builder().name("ПродажиТоваров")
       .attribute(ObjectAttribute.builder().name("Контрагент").build()).build();
-    var children = new java.util.LinkedHashMap<com.github._1c_syntax.bsl.types.MdoReference, MD>();
+    var children = new java.util.LinkedHashMap<MdoReference, MD>();
     children.put(common.getMdoReference(), common);
     children.put(doc.getMdoReference(), doc);
     runTryRegister(
@@ -516,7 +537,7 @@ class ConfigurationTypesProviderHelpersTest {
 
   @Test
   void tryRegister_enumGenericWithTwoParams_earlyReturn() {
-    var anEnum = com.github._1c_syntax.bsl.mdo.Enum.builder().name("ВидыКонтрагентаTwo")
+    var anEnum = Enum.builder().name("ВидыКонтрагентаTwo")
       .enumValue(EnumValue.builder().name("Юридическое").build()).build();
     var typeDecl = new TypePackProvider.TypeDecl(
       TypeKind.PLATFORM,
@@ -538,7 +559,7 @@ class ConfigurationTypesProviderHelpersTest {
 
   @Test
   void tryRegister_enumWithBlankNamedValues_earlyReturn() {
-    var anEnum = com.github._1c_syntax.bsl.mdo.Enum.builder().name("ВидыКонтрагентаB")
+    var anEnum = Enum.builder().name("ВидыКонтрагентаB")
       .enumValue(EnumValue.builder().name("").build()).build();
     runTryRegister(
       "file:///test-enum-blank-values/",
@@ -624,7 +645,7 @@ class ConfigurationTypesProviderHelpersTest {
   private static TypePackProvider.TypeDecl makeGenericTypeDecl(String qualifiedRu, String placeholder) {
     var memberRu = "<Имя значения>";
     var member = MemberDescriptor.genericProperty(memberRu,
-        new com.github._1c_syntax.bsl.languageserver.types.model.TypeRef(TypeKind.PLATFORM, "Строка"),
+        new TypeRef(TypeKind.PLATFORM, "Строка"),
         "")
       .withBilingualName(BilingualString.of(memberRu, "<Value name>"));
     return new TypePackProvider.TypeDecl(
@@ -805,12 +826,12 @@ class ConfigurationTypesProviderHelpersTest {
       });
   }
 
-  private static java.util.Map<com.github._1c_syntax.bsl.types.MdoReference, MD> makeEnumChildren(
+  private static java.util.Map<MdoReference, MD> makeEnumChildren(
       String enumName, String... valueNames) {
     var values = java.util.Arrays.stream(valueNames)
       .map(n -> EnumValue.builder().name(n).build())
       .toList();
-    var enumBuilder = com.github._1c_syntax.bsl.mdo.Enum.builder().name(enumName);
+    var enumBuilder = Enum.builder().name(enumName);
     values.forEach(enumBuilder::enumValue);
     var anEnum = enumBuilder.build();
     return java.util.Map.of(anEnum.getMdoReference(), anEnum);
@@ -820,12 +841,11 @@ class ConfigurationTypesProviderHelpersTest {
       String workspaceUriStr,
       java.util.function.Function<TypeRegistry, TypeRegistry> registryFn,
       List<? extends TypePackProvider.TypeDecl> typeDecls,
-      java.util.Map<com.github._1c_syntax.bsl.types.MdoReference, MD> children,
+      java.util.Map<MdoReference, MD> children,
       java.util.function.BiConsumer<TypeRegistry, ConfigurationTypesProvider> assertion) {
     var workspaceUri = java.net.URI.create(workspaceUriStr);
     WorkspaceContextHolder.registerWorkspace(workspaceUri, "t");
-    WorkspaceContextHolder.set(workspaceUri);
-    try {
+    try (var ignored = WorkspaceContextHolder.forUri(workspaceUri)) {
       var packTypes = new java.util.ArrayList<TypePackProvider.TypeDecl>(typeDecls);
       PlatformTypesProvider pack = new PlatformTypesProvider() {
         @Override
@@ -839,26 +859,25 @@ class ConfigurationTypesProviderHelpersTest {
         }
       };
       var rawRegistry = new TypeRegistry(List.of(pack),
-        Mockito.mock(MemberMetadataIndex.class));
+        mock(MemberMetadataIndex.class), mock(DefinedTypesIndex.class));
       rawRegistry.bootstrap();
       var registry = registryFn.apply(rawRegistry);
-      var configuration = Mockito.mock(Configuration.class);
-      Mockito.when(configuration.isEmpty()).thenReturn(false);
-      Mockito.when(configuration.getChildrenByMdoRef()).thenReturn(children);
-      var serverContext = Mockito.mock(ServerContext.class);
-      Mockito.when(serverContext.getConfiguration()).thenReturn(configuration);
-      var serverProvider = Mockito.mock(ServerContextProvider.class);
-      Mockito.when(serverProvider.getAllContexts())
+      var configuration = mock(Configuration.class);
+      when(configuration.isEmpty()).thenReturn(false);
+      when(configuration.getChildrenByMdoRef()).thenReturn(children);
+      var serverContext = mock(ServerContext.class);
+      when(serverContext.getConfiguration())
+        .thenReturn(Solution.builder().mergedConfiguration(configuration).build());
+      var serverProvider = mock(ServerContextProvider.class);
+      when(serverProvider.getAllContexts())
         .thenReturn(java.util.Map.of(workspaceUri, serverContext));
-      var globalScope = Mockito.mock(GlobalScopeProvider.class);
-      var lsConfig = Mockito.mock(
-        com.github._1c_syntax.bsl.languageserver.configuration.LanguageServerConfiguration.class);
-      var mcs = Mockito.mock(MetadataCollectionSpecializer.class);
-      var provider = new ConfigurationTypesProvider(registry, serverProvider, globalScope,
-        lsConfig, mcs, new ConfigurationGenericExpander(registry, serverProvider), new ServiceModuleEventRegistrar(registry));
+      var globalScope = mock(GlobalScopeProvider.class);
+      var lsConfig = mock(
+        LanguageServerConfiguration.class);
+      var mcs = mock(MetadataCollectionSpecializer.class);
+      var provider = newProvider(registry, serverProvider, globalScope, lsConfig, mcs);
       assertion.accept(registry, provider);
     } finally {
-      WorkspaceContextHolder.clear();
       WorkspaceContextHolder.unregisterWorkspace(workspaceUri);
     }
   }
@@ -866,10 +885,10 @@ class ConfigurationTypesProviderHelpersTest {
   @Test
   void memberPlaceholderName_noGenericMember_returnsEmpty() {
     var registry = new TypeRegistry(List.of(),
-      Mockito.mock(MemberMetadataIndex.class));
+      mock(MemberMetadataIndex.class), mock(DefinedTypesIndex.class));
     var ref = registry.registerConfigurationType("Тип");
     var regular = MemberDescriptor.property("Регулярный",
-      new com.github._1c_syntax.bsl.languageserver.types.model.TypeRef(TypeKind.PLATFORM, "Строка"));
+      new TypeRef(TypeKind.PLATFORM, "Строка"));
     registry.registerMemberSource(ref, () -> List.of(regular), FileType.BSL);
 
     assertThat(ConfigurationTypesProvider.memberPlaceholderName(registry, ref)).isEmpty();

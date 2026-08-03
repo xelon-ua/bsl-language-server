@@ -24,6 +24,7 @@ package com.github._1c_syntax.bsl.languageserver.references;
 import com.github._1c_syntax.bsl.languageserver.context.AbstractServerContextAwareTest;
 import com.github._1c_syntax.bsl.languageserver.references.model.Reference;
 import com.github._1c_syntax.bsl.languageserver.references.model.SymbolOccurrenceRepository;
+import com.github._1c_syntax.bsl.languageserver.types.oscript.OScriptLibraryIndex;
 import com.github._1c_syntax.bsl.languageserver.util.CleanupContextBeforeClassAndAfterClass;
 import com.github._1c_syntax.bsl.languageserver.util.TestUtils;
 import com.github._1c_syntax.bsl.languageserver.utils.Ranges;
@@ -51,6 +52,9 @@ class ReferenceIndexTest extends AbstractServerContextAwareTest {
 
   @Autowired
   private SymbolOccurrenceRepository symbolOccurrenceRepository;
+
+  @Autowired
+  private OScriptLibraryIndex oScriptLibraryIndex;
 
   private static final String PATH_TO_FILE = "./src/test/resources/references/ReferenceIndex.bsl";
 
@@ -138,6 +142,32 @@ class ReferenceIndexTest extends AbstractServerContextAwareTest {
       .isNotEmpty()
       .contains(Reference.of(methodSymbol, calledMethodSymbol, location))
     ;
+  }
+
+  @Test
+  void commonModuleMethodIsFunctionAndItsCallsAreFound() {
+    // given
+    var documentContext = TestUtils.getDocumentContextFromFile(PATH_TO_FILE);
+    var callerMethod = documentContext.getSymbolTree().getMethodSymbol("ИмяПроцедуры").orElseThrow();
+
+    var commonModuleContext = context
+      .getDocument("CommonModule.ПервыйОбщийМодуль", ModuleType.CommonModule)
+      .orElseThrow();
+    var calledMethod = commonModuleContext.getSymbolTree().getMethodSymbol("УстаревшаяПроцедура").orElseThrow();
+
+    var location = new Location(documentContext.getUri().toString(), Ranges.create(2, 22, 41));
+
+    // when
+    var references = referenceIndex.getReferencesTo(calledMethod);
+
+    // then
+    // метод общего модуля BSL — самостоятельная функция (SymbolKind.Function); его вызовы
+    // индексируются под каноническим SymbolKind.Method (ReferenceIndex#indexedKindOf), поэтому
+    // Find References/Rename находят их без приведения вида на месте вызова
+    assertThat(calledMethod.getSymbolKind()).isEqualTo(SymbolKind.Function);
+    assertThat(references)
+      .isNotEmpty()
+      .contains(Reference.of(callerMethod, calledMethod, location));
   }
 
   @Test
@@ -390,10 +420,11 @@ class ReferenceIndexTest extends AbstractServerContextAwareTest {
       // given - workspace 1 is already initialized with PATH_TO_METADATA in @BeforeEach
       // Manually add a reference to workspace 1's repos to verify isolation
       var workspace1Uri = context.getDocuments().keySet().iterator().next();
-      referenceIndex.addMethodCall(
+      var occurrence = referenceIndex.methodCallOccurrence(
         workspace1Uri, "CommonModule.TestModule", ModuleType.CommonModule, "TestMethod",
         Ranges.create(0, 0, 10)
       );
+      referenceIndex.replaceReferences(workspace1Uri, java.util.List.of(occurrence));
 
       // Build the same Symbol key used for both workspaces
       var symbolDto = com.github._1c_syntax.bsl.languageserver.references.model.Symbol.builder()

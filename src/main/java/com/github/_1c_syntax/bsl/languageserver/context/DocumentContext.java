@@ -31,9 +31,10 @@ import com.github._1c_syntax.bsl.languageserver.context.computer.DiagnosticCompu
 import com.github._1c_syntax.bsl.languageserver.context.computer.DiagnosticIgnoranceComputer;
 import com.github._1c_syntax.bsl.languageserver.context.computer.QueryComputer;
 import com.github._1c_syntax.bsl.languageserver.context.computer.SymbolTreeComputer;
+import com.github._1c_syntax.bsl.languageserver.context.symbol.EventHandlerClassifier;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.MethodSymbol;
+import com.github._1c_syntax.bsl.languageserver.context.symbol.SelfMemberClassifier;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.SymbolTree;
-import com.github._1c_syntax.bsl.languageserver.utils.MdoRefBuilder;
 import com.github._1c_syntax.bsl.languageserver.utils.Trees;
 import com.github._1c_syntax.bsl.mdo.MD;
 import com.github._1c_syntax.bsl.parser.BSLLexer;
@@ -41,10 +42,7 @@ import com.github._1c_syntax.bsl.parser.BSLParser;
 import com.github._1c_syntax.bsl.parser.BSLTokenizer;
 import com.github._1c_syntax.bsl.parser.SDBLTokenizer;
 import com.github._1c_syntax.bsl.support.SupportVariant;
-import com.github._1c_syntax.bsl.types.ConfigurationSource;
-import com.github._1c_syntax.bsl.languageserver.types.oscript.OScriptModuleTypeResolver;
 import com.github._1c_syntax.bsl.types.ModuleType;
-import com.github._1c_syntax.bsl.types.ScriptVariant;
 import com.github._1c_syntax.utils.Lazy;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
@@ -120,6 +118,14 @@ public class DocumentContext implements Comparable<DocumentContext> {
   @Setter(onMethod_ = {@Autowired})
   private OScriptModuleTypeResolver oScriptModuleTypeResolver;
 
+  @SuppressWarnings("NullAway.Init")
+  @Setter(onMethod_ = {@Autowired})
+  private SelfMemberClassifier selfMemberClassifier;
+
+  @SuppressWarnings("NullAway.Init")
+  @Setter(onMethod_ = {@Autowired})
+  private EventHandlerClassifier eventHandlerClassifier;
+
   @Nullable
   private BSLTokenizer tokenizer;
 
@@ -137,6 +143,12 @@ public class DocumentContext implements Comparable<DocumentContext> {
 
   private final Lazy<String[]> contentList = new Lazy<>(this::computeContentList, computeLock);
   private final Lazy<ModuleType> moduleType = new Lazy<>(this::computeModuleType, computeLock);
+  // MD-объект и mdoRef документа зависят только от его URI и конфигурации (не от содержимого),
+  // а конфигурация инвариантна на всё время жизни DocumentContext (её перезагрузка в
+  // ServerContext.clear() выбрасывает все документы). Поэтому намеренно НЕ сбрасываются в
+  // clearSecondaryData — считаются один раз на жизнь документа.
+  private final Lazy<Optional<MD>> mdObject = new Lazy<>(this::computeMdObject, computeLock);
+  private final Lazy<String> mdoRef = new Lazy<>(this::computeMdoRef, computeLock);
   private final Lazy<ComplexityData> cognitiveComplexityData
     = new Lazy<>(this::computeCognitiveComplexity, computeLock);
   private final Lazy<ComplexityData> cyclomaticComplexityData
@@ -236,21 +248,12 @@ public class DocumentContext implements Comparable<DocumentContext> {
    * настройкам интерфейса).
    */
   public Language getScriptVariantLanguage() {
-    var mdConfiguration = getServerContext().getConfiguration();
-    if (mdConfiguration.getConfigurationSource() == ConfigurationSource.EMPTY || fileType == FileType.OS) {
+    if (fileType == FileType.OS) {
+      // Единственная поправка документа к языку проекта: OneScript-файл к конфигурации
+      // не относится, и её ScriptVariant про него ничего не говорит.
       return getServerContext().getLanguageServerConfiguration().getLanguage();
     }
-    var scriptVariant = mdConfiguration.getScriptVariant();
-    if (scriptVariant == ScriptVariant.UNKNOWN) {
-      // Не удалось определить язык встроенного языка конфигурации —
-      // мягкий фолбэк на UI-язык LS (бросать нельзя: метод дёргается в
-      // hot-path completion/hover).
-      return getServerContext().getLanguageServerConfiguration().getLanguage();
-    }
-    var shortName = scriptVariant.shortName();
-    return "en".equalsIgnoreCase(shortName)
-      ? Language.EN
-      : Language.RU;
+    return getServerContext().getScriptVariantLanguage();
   }
 
   public MetricStorage getMetrics() {
@@ -278,7 +281,7 @@ public class DocumentContext implements Comparable<DocumentContext> {
   }
 
   public Optional<MD> getMdObject() {
-    return getServerContext().getConfiguration().findChild(getUri());
+    return mdObject.getOrCompute();
   }
 
   /**
@@ -288,7 +291,7 @@ public class DocumentContext implements Comparable<DocumentContext> {
    * @return Строковое представление ссылки
    */
   public String getMdoRef() {
-    return MdoRefBuilder.getMdoRef(this);
+    return mdoRef.getOrCompute();
   }
 
   public List<SDBLTokenizer> getQueries() {
@@ -430,7 +433,7 @@ public class DocumentContext implements Comparable<DocumentContext> {
   }
 
   private SymbolTree computeSymbolTree() {
-    return new SymbolTreeComputer(this).compute();
+    return new SymbolTreeComputer(this, selfMemberClassifier, eventHandlerClassifier).compute();
   }
 
 
@@ -440,6 +443,14 @@ public class DocumentContext implements Comparable<DocumentContext> {
       return fromConfiguration;
     }
     return oScriptModuleTypeResolver.resolve(uri).orElse(fromConfiguration);
+  }
+
+  private Optional<MD> computeMdObject() {
+    return getServerContext().getConfiguration().findChild(getUri());
+  }
+
+  private String computeMdoRef() {
+    return MdoRefBuilder.getMdoRef(this);
   }
 
   private ComplexityData computeCognitiveComplexity() {

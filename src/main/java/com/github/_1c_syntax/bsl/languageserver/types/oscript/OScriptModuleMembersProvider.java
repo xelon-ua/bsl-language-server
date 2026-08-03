@@ -28,12 +28,13 @@ import com.github._1c_syntax.bsl.languageserver.context.symbol.MethodSymbol;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.VariableSymbol;
 import com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceScope;
 
+import com.github._1c_syntax.bsl.languageserver.types.model.BilingualString;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.ParameterDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.SignatureDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeRef;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeSet;
-import com.github._1c_syntax.bsl.languageserver.types.MemberTypeFromCommentResolver;
+import com.github._1c_syntax.bsl.languageserver.types.CommentTypeResolver;
 import com.github._1c_syntax.bsl.languageserver.types.registry.GlobalScopeProvider;
 import com.github._1c_syntax.bsl.languageserver.types.registry.TypeRegistry;
 import com.github._1c_syntax.bsl.languageserver.utils.DescriptionTypes;
@@ -42,11 +43,14 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.io.FilenameUtils;
 import org.springframework.context.event.EventListener;
+import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
 import java.net.URI;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -69,7 +73,9 @@ import java.util.concurrent.ConcurrentHashMap;
  *   <li>регистрирует ленивый {@code MemberSource}, который при каждом запросе
  *       идёт в актуальный {@code SymbolTree} документа (это даёт hot-reload);</li>
  *   <li>для OScriptClass дополнительно регистрирует ленивый источник
- *       конструкторов из {@code ПриСозданииОбъекта}.</li>
+ *       конструкторов из {@code ПриСозданииОбъекта} и связывает URI класса с его
+ *       типом в {@link GlobalScopeProvider} (self-тип: неквалифицированный доступ
+ *       к своим членам и встроенным методам класса внутри его же тела).</li>
  * </ul>
  */
 @Slf4j
@@ -78,18 +84,26 @@ import java.util.concurrent.ConcurrentHashMap;
 @RequiredArgsConstructor
 public class OScriptModuleMembersProvider {
 
+  private static final String RAISE_EVENT_NAME_RU = "ВызватьСобытие";
+  private static final String RAISE_EVENT_NAME_EN = "RaiseEvent";
+  private static final String THIS_OBJECT_NAME_RU = "ЭтотОбъект";
+  private static final String THIS_OBJECT_NAME_EN = "ThisObject";
+
   private final TypeRegistry typeRegistry;
   private final OScriptLibraryIndex oScriptLibraryIndex;
   private final GlobalScopeProvider globalScopeProvider;
   private final OScriptExtends oScriptExtends;
   private final TypeRelations typeRelations;
   private final OScriptIterable oScriptIterable;
-  private final MemberTypeFromCommentResolver memberTypeFromCommentResolver;
+  private final CommentTypeResolver commentTypeResolver;
 
   /** URI документа → множество qualifiedNames зарегистрированных типов
    *  (один .os может одновременно быть и модулем, и классом). */
   private final Map<URI, Set<String>> registeredByUri = new ConcurrentHashMap<>();
 
+  // Раньше ReferenceIndexFiller (@Order 200): register() наполняет moduleTypeRefByUri
+  // OScript-типов, от которого зависит self-member проход индексатора.
+  @Order(100)
   @EventListener
   public void handleEvent(DocumentContextContentChangedEvent event) {
     var documentContext = event.getSource();
@@ -97,6 +111,41 @@ public class OScriptModuleMembersProvider {
       return;
     }
     register(documentContext);
+    invalidateMembersOfDocumentAndSubtypes(documentContext);
+  }
+
+  /**
+   * Точечно сбросить memo членов правленого документа и всех его наследников.
+   * <p>
+   * Member-source типа лениво читает символьное дерево своего документа, поэтому правка
+   * требует пересборки его членов. Наследники задеты транзитивно: источник унаследованных
+   * членов ({@code TypeRelations.inheritedMembers}) копирует к себе результат
+   * {@code getMembers} родителя, так что в memo наследника лежит снимок членов родителя —
+   * сброса одного лишь родителя недостаточно, снимок «протухает» на всю глубину иерархии.
+   * <p>
+   * Обход идёт по прямым наследникам ({@code &Расширяет}); интерфейсы ({@code &Реализует})
+   * членов не приносят, поэтому реализаторов обходить не нужно. Повторные посещения
+   * отсекаются по URI — это же защищает от циклов в объявлениях наследования.
+   *
+   * @param documentContext правленый {@code .os}-документ.
+   */
+  private void invalidateMembersOfDocumentAndSubtypes(DocumentContext documentContext) {
+    var visited = new HashSet<URI>();
+    var queue = new ArrayDeque<DocumentContext>();
+    queue.add(documentContext);
+    while (!queue.isEmpty()) {
+      var current = queue.poll();
+      if (!visited.add(current.getUri())) {
+        continue;
+      }
+      var names = registeredByUri.get(current.getUri());
+      if (names != null) {
+        for (var name : names) {
+          typeRegistry.resolve(name, FileType.OS).ifPresent(typeRegistry::invalidateMembers);
+        }
+      }
+      queue.addAll(typeRelations.subtypes(current));
+    }
   }
 
   /**
@@ -147,6 +196,8 @@ public class OScriptModuleMembersProvider {
         if (libraryEntry.kind() == OScriptLibraryIndex.EntryKind.CLASS) {
           typeRegistry.registerConstructorSource(ref, () -> collectConstructors(documentContext, ref), FileType.OS);
           registerInheritedMembers(documentContext, ref);
+          typeRegistry.registerMemberSource(ref, () -> builtinClassMembers(ref), FileType.OS);
+          registerSelfTypeUnlessModuleRoleClaimedIt(uri, ref);
         } else if (libraryEntry.kind() == OScriptLibraryIndex.EntryKind.MODULE) {
           // Обратный индекс URI→тип для вывода типа ресивера-модуля по ModuleSymbol
           // (единый источник в GlobalScopeProvider вместо обращения инференсера к
@@ -161,6 +212,8 @@ public class OScriptModuleMembersProvider {
       } else if (documentContext.getModuleType() == ModuleType.OScriptClass) {
         typeRegistry.registerConstructorSource(ref, () -> collectConstructors(documentContext, ref), FileType.OS);
         registerInheritedMembers(documentContext, ref);
+        typeRegistry.registerMemberSource(ref, () -> builtinClassMembers(ref), FileType.OS);
+        globalScopeProvider.indexModuleType(uri, ref);
       }
       LOGGER.debug("Registered .os module-as-type: {} -> {} kind={}", uri, qualifiedName,
         libraryEntry != null ? libraryEntry.kind() : documentContext.getModuleType());
@@ -204,6 +257,53 @@ public class OScriptModuleMembersProvider {
     );
   }
 
+  /**
+   * Связать URI library-класса с его типом в {@link GlobalScopeProvider}, если
+   * этот URI ещё не занят типом модуля. Пропускается для dual-role .os-файла
+   * (одновременно {@code <module>} и {@code <class>} на один {@code file}):
+   * ролью модуля URI уже занят, и его self-тип не должен смениться на класс.
+   */
+  private void registerSelfTypeUnlessModuleRoleClaimedIt(URI uri, TypeRef classRef) {
+    if (globalScopeProvider.moduleTypeRefByUri(uri).isEmpty()) {
+      globalScopeProvider.indexModuleType(uri, classRef);
+    }
+  }
+
+  /**
+   * Встроенные члены, доступные у ЛЮБОГО OScript-класса вне зависимости от
+   * того, что он объявляет сам: {@code ВызватьСобытие}/{@code RaiseEvent}
+   * (оповещает подписчиков, добавленных через {@code ДобавитьОбработчик}/
+   * {@code AddHandler}; не связан с аннотацией {@code &Событие} — это отдельный,
+   * не поддерживаемый здесь механизм) и {@code ЭтотОбъект}/{@code ThisObject}
+   * (ссылка на текущий экземпляр класса).
+   */
+  private List<MemberDescriptor> builtinClassMembers(TypeRef classRef) {
+    var stringType = typeRegistry.resolve("Строка", FileType.OS).map(TypeSet::of).orElse(TypeSet.EMPTY);
+    var arrayType = typeRegistry.resolve("Массив", FileType.OS).map(TypeSet::of).orElse(TypeSet.EMPTY);
+    var signature = new SignatureDescriptor(
+      List.of(
+        new ParameterDescriptor(BilingualString.of("ИмяСобытия", "EventName"), stringType, false,
+          BilingualString.of("Имя события.", "Event name."), ""),
+        new ParameterDescriptor(BilingualString.of("ПараметрыСобытия", "EventArgs"), arrayType, true,
+          BilingualString.of("Параметры события, передаваемые подписчикам.",
+            "Event arguments passed to subscribers."), "")
+      ),
+      TypeSet.EMPTY,
+      BilingualString.EMPTY
+    );
+    var raiseEvent = MemberDescriptor.method(RAISE_EVENT_NAME_RU,
+        "Вызывает событие с указанным именем, оповещая подписчиков, добавленных через "
+          + "ДобавитьОбработчик/AddHandler.",
+        List.of(signature))
+      .withBilingualName(BilingualString.of(RAISE_EVENT_NAME_RU, RAISE_EVENT_NAME_EN))
+      .withStandardLibrary(true);
+    var thisObject = MemberDescriptor.property(THIS_OBJECT_NAME_RU, classRef,
+        "Ссылка на текущий экземпляр класса.")
+      .withBilingualName(BilingualString.of(THIS_OBJECT_NAME_RU, THIS_OBJECT_NAME_EN))
+      .withStandardLibrary(true);
+    return List.of(raiseEvent, thisObject);
+  }
+
   private Collection<MemberDescriptor> collectMembers(DocumentContext documentContext) {
     var symbolTree = documentContext.getSymbolTree();
     var constructor = symbolTree.getConstructor();
@@ -234,10 +334,10 @@ public class OScriptModuleMembersProvider {
    * Типы экспортной переменной-свойства из типизирующего висячего комментария
    * её декларации ({@code Перем Контейнер Экспорт; // Массив из Число},
    * {@code Перем Сложно Экспорт; // см. НовыйСложно}). Делегирует общему для обоих
-   * языков {@link MemberTypeFromCommentResolver}.
+   * языков {@link CommentTypeResolver}.
    */
   private TypeSet propertyTypesFromComment(VariableSymbol variable) {
-    return memberTypeFromCommentResolver.resolve(variable, FileType.OS);
+    return commentTypeResolver.resolve(variable, FileType.OS);
   }
 
   private List<SignatureDescriptor> collectConstructors(DocumentContext documentContext, TypeRef classRef) {

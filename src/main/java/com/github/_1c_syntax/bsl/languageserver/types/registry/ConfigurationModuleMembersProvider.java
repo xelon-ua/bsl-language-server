@@ -21,30 +21,35 @@
  */
 package com.github._1c_syntax.bsl.languageserver.types.registry;
 
+import com.github._1c_syntax.bsl.context.api.ContextNames;
 import com.github._1c_syntax.bsl.languageserver.context.FileType;
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
 import com.github._1c_syntax.bsl.languageserver.context.events.DocumentContextContentChangedEvent;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.MethodSymbol;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.VariableSymbol;
 import com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceScope;
-import com.github._1c_syntax.bsl.languageserver.types.MemberTypeFromCommentResolver;
+import com.github._1c_syntax.bsl.languageserver.types.CommentTypeResolver;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.ParameterDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.SignatureDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeRef;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeSet;
-import com.github._1c_syntax.bsl.parser.description.TypeDescription;
+import com.github._1c_syntax.bsl.mdo.Form;
+import com.github._1c_syntax.bsl.mdo.MD;
 import com.github._1c_syntax.bsl.types.ModuleType;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.event.EventListener;
+import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Stream;
 
 /**
  * Расширяет платформенные типы менеджеров/объектов/наборов записей
@@ -72,6 +77,14 @@ public class ConfigurationModuleMembersProvider {
     ModuleType.ValueManagerModule, "МенеджерЗначения"
   );
 
+  /**
+   * Платформенный тип общего модуля синтакс-помощника — единственный,
+   * неспециализируемый по имени (в отличие от {@code СправочникОбъект.<Имя>}
+   * и т.п.): все общие модули структурно одинаковы, различаются только
+   * значением.
+   */
+  private static final String COMMON_MODULE_PLATFORM_TYPE_NAME = "ОбщийМодуль";
+
   private static final Map<ModuleType, String> MODULE_TYPE_TO_WRAPPER_EN = Map.of(
     ModuleType.ManagerModule, "Manager",
     ModuleType.ObjectModule, "Object",
@@ -81,21 +94,73 @@ public class ConfigurationModuleMembersProvider {
 
   private final TypeRegistry typeRegistry;
   private final GlobalScopeProvider globalScopeProvider;
-  private final MemberTypeFromCommentResolver memberTypeFromCommentResolver;
+  private final CommentTypeResolver commentTypeResolver;
+  private final DescribedTypeResolver describedTypeResolver;
 
   /** Уже зарегистрированные источники (по URI документа), чтобы избежать дублей. */
   private final Map<URI, TypeRef> registeredByUri = new ConcurrentHashMap<>();
 
+  // Раньше ReferenceIndexFiller (@Order 200): register() наполняет moduleTypeRefByUri,
+  // от которого зависит self-member проход индексатора. Без явного порядка filler мог
+  // отработать раньше и пропустить self-члены (см. ReferenceIndexFiller).
+  @Order(100)
   @EventListener
   public void handleEvent(DocumentContextContentChangedEvent event) {
     var documentContext = event.getSource();
     register(documentContext);
   }
 
+  /**
+   * RU-qualifiedName self-типа модуля по его метаданным — та же специализация, что
+   * регистрирует {@link #register} ({@code СправочникОбъект.Контрагенты},
+   * {@code ДокументНаборЗаписей.…}; для общего модуля — имя модуля). Чистая функция
+   * без побочных эффектов и без опоры на {@code moduleTypeRefByUri}.
+   * <p>
+   * Нужна, чтобы резолвить self-тип <b>из метаданных напрямую</b> на первой сборке
+   * дерева символов — до того как {@link #register} (слушатель
+   * {@code DocumentContextContentChangedEvent}) наполнит {@code moduleTypeRefByUri}:
+   * дерево строится внутри {@code DocumentContext.rebuild}, а событие публикуется
+   * AOP уже после возврата из него, поэтому кэш на момент классификации self-членов
+   * ещё пуст (см. {@code TypeService#findSelfMember}, аналогично
+   * {@code EventHandlerResolver#resolveOwnerType}).
+   *
+   * @param moduleType вид модуля документа.
+   * @param mdObject   MD-объект документа.
+   * @return RU-qualifiedName self-типа; empty, если модуль не несёт self-тип или
+   *   части имени не заполнены.
+   */
+  public static Optional<String> selfTypeQualifiedName(ModuleType moduleType, MD mdObject) {
+    if (moduleType == ModuleType.CommonModule) {
+      var name = mdObject.getName();
+      return name.isBlank() ? Optional.empty() : Optional.of(name);
+    }
+    if (moduleType == ModuleType.FormModule) {
+      // Форма — не обёртка над MD-объектом, а самостоятельный тип с реквизитами и
+      // элементами; его имя строит FormTypesProvider (см. его javadoc).
+      return mdObject instanceof Form form
+        ? Optional.of(FormTypesProvider.moduleTypeQualifiedName(form))
+        : Optional.empty();
+    }
+    var wrapperSuffix = MODULE_TYPE_TO_WRAPPER_RU.get(moduleType);
+    if (wrapperSuffix == null) {
+      return Optional.empty();
+    }
+    var groupNameRu = mdObject.getMdoType().fullName().getRu();
+    var name = mdObject.getName();
+    if (groupNameRu.isBlank() || name.isBlank()) {
+      return Optional.empty();
+    }
+    return Optional.of(groupNameRu + wrapperSuffix + "." + name);
+  }
+
   private void register(DocumentContext documentContext) {
     var moduleType = documentContext.getModuleType();
     if (moduleType == ModuleType.CommonModule) {
       registerCommonModule(documentContext);
+      return;
+    }
+    if (moduleType == ModuleType.FormModule) {
+      registerFormModule(documentContext);
       return;
     }
     if (!MODULE_TYPE_TO_WRAPPER_RU.containsKey(moduleType)) {
@@ -130,12 +195,44 @@ public class ConfigurationModuleMembersProvider {
     var prev = registeredByUri.put(documentContext.getUri(), ref);
     globalScopeProvider.indexModuleType(documentContext.getUri(), ref);
     if (prev != null && prev.equals(ref)) {
-      // тот же URI/тип — источник уже зарегистрирован, AST подхватится автоматически
+      // источник уже зарегистрирован, но содержимое изменилось (rebuild) — его member-source
+      // лениво читает символьное дерево, поэтому точечно сбрасываем memo членов только этого
+      // типа; кэши прочих типов остаются валидными (без сдвига глобальной эпохи).
+      typeRegistry.invalidateMembers(ref);
       return;
     }
 
     typeRegistry.registerMemberSource(ref, () -> collectModuleMembers(documentContext), FileType.BSL);
     LOGGER.debug("Registered module-as-member-source for {} -> {}", documentContext.getUri(), qualifiedRu);
+  }
+
+  /**
+   * Модуль формы: связывает URI документа с типом формы (его состав —
+   * реквизиты/элементы/события — регистрирует {@link FormTypesProvider} из метаданных)
+   * и добавляет к нему экспортные методы и переменные самого модуля. Именно эта связь
+   * даёт в модуле формы разыменование {@code ЭтотОбъект.} и резолв неквалифицированных
+   * имён реквизитов и элементов.
+   */
+  private void registerFormModule(DocumentContext documentContext) {
+    var mdObjectOpt = documentContext.getMdObject();
+    if (mdObjectOpt.isEmpty() || !(mdObjectOpt.get() instanceof Form form)) {
+      return;
+    }
+    var ref = typeRegistry.registerConfigurationType(FormTypesProvider.moduleTypeQualifiedName(form));
+
+    var prev = registeredByUri.put(documentContext.getUri(), ref);
+    globalScopeProvider.indexModuleType(documentContext.getUri(), ref);
+    if (prev != null && prev.equals(ref)) {
+      // Источник уже зарегистрирован, но содержимое изменилось (rebuild): он лениво
+      // читает символьное дерево, и без сброса memo в модуле формы остались бы
+      // экспортные методы и переменные предыдущей редакции — как и в общем пути выше.
+      typeRegistry.invalidateMembers(ref);
+      return;
+    }
+
+    typeRegistry.registerMemberSource(ref, () -> collectModuleMembers(documentContext), FileType.BSL);
+    LOGGER.debug("Registered form module as member source for {} -> {}",
+      documentContext.getUri(), ref.qualifiedName());
   }
 
   private void registerCommonModule(DocumentContext documentContext) {
@@ -160,11 +257,61 @@ public class ConfigurationModuleMembersProvider {
       documentContext.getSymbolTree().getModule());
 
     if (prev != null && prev.equals(ref)) {
+      // содержимое изменилось (rebuild): точечно пересобрать memo членов самого модуля
+      // и члена GLOBAL_CONTEXT (в него вошёл обновлённый symbol-источник модуля) — без
+      // сдвига глобальной эпохи членов. Name-индекс глобальной области отдельно сбрасывать
+      // не нужно: он кэширован по набору-источнику и пересоберётся сам, увидев новый набор.
+      typeRegistry.invalidateMembers(ref);
+      typeRegistry.invalidateMembers(TypeRegistry.GLOBAL_CONTEXT);
       return;
     }
 
     typeRegistry.registerMemberSource(ref, () -> collectModuleMembers(documentContext), FileType.BSL);
+    typeRegistry.registerMemberSource(ref, () -> commonModulePlatformMembers(ref), FileType.BSL);
     LOGGER.debug("Registered common module as global property {} -> {}", documentContext.getUri(), name);
+  }
+
+  /**
+   * Платформенные члены общего модуля (сейчас — только {@code ЭтотОбъект}) из
+   * реального типа {@value #COMMON_MODULE_PLATFORM_TYPE_NAME} синтакс-помощника
+   * (HBK либо JSON-фолбек — обычный {@link TypeRegistry#getMembers}). Если тип
+   * не зарегистрирован ни там, ни там — возвращает пусто.
+   * <p>
+   * {@code ЭтотОбъект} специализируется на {@code selfRef} (тип конкретного
+   * общего модуля), а не остаётся с обобщённым возвращаемым типом
+   * {@code ОбщийМодуль}: иначе dot-completion после {@code ЭтотОбъект.} не
+   * показывал бы собственные экспортные методы этого модуля (их даёт
+   * {@link #collectModuleMembers}, зарегистрированный на тот же {@code selfRef}).
+   * <p>
+   * Generic-плейсхолдер {@code <Имя процедуры или функции>} отфильтровывается
+   * по тексту имени, а не по флагу {@code generic} — bsl-context его методам
+   * не проставляет (в отличие от свойств).
+   */
+  private List<MemberDescriptor> commonModulePlatformMembers(TypeRef selfRef) {
+    var genericRefOpt = typeRegistry.resolve(COMMON_MODULE_PLATFORM_TYPE_NAME, FileType.BSL);
+    if (genericRefOpt.isEmpty()) {
+      return List.of();
+    }
+    var genericRef = genericRefOpt.get();
+    // Общий модуль, буквально названный "ОбщийМодуль", резолвится в сам платформенный
+    // generic-тип: selfRef == genericRef. Специализировать тип на самом себе нельзя, а
+    // getMembers(genericRef) здесь ушёл бы обратно в этот же источник → бесконечная
+    // рекурсия (StackOverflowError). Платформенные члены у него и так уже есть — выходим.
+    if (genericRef.equals(selfRef)) {
+      return List.of();
+    }
+    var members = typeRegistry.getMembers(genericRef, FileType.BSL);
+    var result = new ArrayList<MemberDescriptor>(members.size());
+    for (var member : members) {
+      if (!ContextNames.placeholders(member.name()).isEmpty()) {
+        continue;
+      }
+      if (member.returnTypes().refs().contains(genericRef)) {
+        member = member.withReturnTypes(TypeSet.of(selfRef));
+      }
+      result.add(member);
+    }
+    return result;
   }
 
   /**
@@ -172,23 +319,20 @@ public class ConfigurationModuleMembersProvider {
    * Экспортные {@code Перем X Экспорт} модулей объекта/набора записей и т.п.
    * становятся свойствами соответствующего типа ({@code СправочникОбъект.X}),
    * тип свойства выводится из висячего комментария декларации через общий
-   * {@link MemberTypeFromCommentResolver}.
+   * {@link CommentTypeResolver}.
    */
   private List<MemberDescriptor> collectModuleMembers(DocumentContext documentContext) {
-    var members = new ArrayList<MemberDescriptor>();
-    documentContext.getSymbolTree().getMethods().stream()
+    var methodMembers = documentContext.getSymbolTree().getMethods().stream()
       .filter(MethodSymbol::isExport)
-      .map(this::toMethodMember)
-      .forEach(members::add);
-    documentContext.getSymbolTree().getVariables().stream()
+      .map(this::toMethodMember);
+    var variableMembers = documentContext.getSymbolTree().getVariables().stream()
       .filter(VariableSymbol::isExport)
-      .map(this::toVariableMember)
-      .forEach(members::add);
-    return members;
+      .map(this::toVariableMember);
+    return Stream.concat(methodMembers, variableMembers).toList();
   }
 
   private MemberDescriptor toVariableMember(VariableSymbol variable) {
-    var types = memberTypeFromCommentResolver.resolve(variable, FileType.BSL);
+    var types = commentTypeResolver.resolve(variable, FileType.BSL);
     var description = variable.getDescription()
       .map(d -> d.getDescription() == null ? "" : d.getDescription().trim())
       .orElse("");
@@ -200,7 +344,7 @@ public class ConfigurationModuleMembersProvider {
     var params = method.getParameters().stream()
       .map(p -> new ParameterDescriptor(
         p.getName(),
-        TypeSet.EMPTY,
+        describedTypeResolver.parameterTypes(p),
         p.isOptional(),
         ""
       ))
@@ -209,32 +353,11 @@ public class ConfigurationModuleMembersProvider {
       .map(d -> d.getDescription() == null ? "" : d.getDescription().trim())
       .orElse("");
     var returnType = method.getDescription()
-      .map(d -> resolveReturnType(d.getReturnedValue()))
+      .map(d -> describedTypeResolver.returnType(d.getReturnedValue()))
       .orElse(TypeRef.UNKNOWN);
     var signature = new SignatureDescriptor(params, returnType, description);
     return MemberDescriptor
       .method(method.getName(), description, List.of(signature))
       .withSourceSymbol(method);
-  }
-
-  /**
-   * Парсит первый элемент {@code returnedValue} JavaDoc-описания BSL-метода
-   * (например, "Массив из Произвольный" → "Массив") и резолвит через
-   * {@link TypeRegistry}.
-   */
-  private TypeRef resolveReturnType(
-    List<TypeDescription> returnedValue
-  ) {
-    if (returnedValue == null || returnedValue.isEmpty()) {
-      return TypeRef.UNKNOWN;
-    }
-    var raw = returnedValue.get(0).name();
-    if (raw == null || raw.isBlank()) {
-      return TypeRef.UNKNOWN;
-    }
-    // отбрасываем пояснения после первого пробела/угловой скобки/квадратной скобки
-    // ("Массив из Произвольный", "Массив<Произвольный>" → "Массив")
-    var head = raw.trim().split("[\\s<\\[]", 2)[0];
-    return typeRegistry.resolve(head).orElse(TypeRef.UNKNOWN);
   }
 }

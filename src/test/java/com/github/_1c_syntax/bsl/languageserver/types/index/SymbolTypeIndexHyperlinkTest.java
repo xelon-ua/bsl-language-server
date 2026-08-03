@@ -22,6 +22,7 @@
 package com.github._1c_syntax.bsl.languageserver.types.index;
 
 import com.github._1c_syntax.bsl.languageserver.context.FileType;
+import com.github._1c_syntax.bsl.languageserver.context.symbol.SourceDefinedSymbol;
 import com.github._1c_syntax.bsl.languageserver.types.model.BilingualString;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.ParameterDescriptor;
@@ -29,6 +30,7 @@ import com.github._1c_syntax.bsl.languageserver.types.model.SignatureDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeKind;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeRef;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeSet;
+import com.github._1c_syntax.bsl.languageserver.types.registry.FormByNameResolver;
 import com.github._1c_syntax.bsl.languageserver.types.registry.TypeRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -45,6 +47,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
@@ -66,7 +69,7 @@ class SymbolTypeIndexHyperlinkTest {
 
   @BeforeEach
   void setUp() {
-    index = new SymbolTypeIndex(typeRegistry);
+    index = new SymbolTypeIndex(typeRegistry, mock(FormByNameResolver.class));
   }
 
   @Test
@@ -118,6 +121,25 @@ class SymbolTypeIndexHyperlinkTest {
 
     // when — последний сегмент в ссылке = имя параметра
     var result = index.resolveHyperlink("ОбщегоНазначения.МойМетод.Док", FileType.BSL);
+
+    // then
+    assertThat(result.refs()).containsExactly(ARRAY);
+  }
+
+  @Test
+  void resolveHyperlinkModuleMethodParameterResolvesWhenReturnTypeUnknown() {
+    // given — у метода тип возврата UNKNOWN (как у процедур и недокументированных
+    // функций), но последний сегмент — имя его параметра.
+    var param = new ParameterDescriptor(
+      BilingualString.of("Док"), TypeSet.of(ARRAY), false, BilingualString.EMPTY, "");
+    var method = MemberDescriptor.method("МояПроцедура",
+      List.of(new SignatureDescriptor(List.of(param), TypeRef.UNKNOWN, "")));
+    when(typeRegistry.resolve(eq("ОбщегоНазначения"), any(FileType.class)))
+      .thenReturn(Optional.of(MODULE));
+    when(typeRegistry.getMembers(eq(MODULE), any(FileType.class))).thenReturn(List.of(method));
+
+    // when — последний сегмент в ссылке = имя параметра
+    var result = index.resolveHyperlink("ОбщегоНазначения.МояПроцедура.Док", FileType.BSL);
 
     // then
     assertThat(result.refs()).containsExactly(ARRAY);
@@ -189,5 +211,70 @@ class SymbolTypeIndexHyperlinkTest {
 
     // then
     assertThat(result).isSameAs(TypeSet.EMPTY);
+  }
+
+  @Test
+  void resolveReferenceSymbolReturnsEmptyForBlankOrUnqualified() {
+    // пустая ссылка и ссылка без точки (parts < 2) символ не дают
+    assertThat(index.resolveReferenceSymbol("", FileType.BSL)).isEmpty();
+    assertThat(index.resolveReferenceSymbol("   ", FileType.BSL)).isEmpty();
+    assertThat(index.resolveReferenceSymbol("Метод", FileType.BSL)).isEmpty();
+  }
+
+  @Test
+  void resolveReferenceSymbolReturnsSourceSymbolForModuleMethod() {
+    // given — у найденного члена есть source-defined символ-источник
+    var sourceSymbol = mock(SourceDefinedSymbol.class);
+    var method = MemberDescriptor.method("МойМетод",
+      List.of(new SignatureDescriptor(List.of(), STRING, ""))).withSourceSymbol(sourceSymbol);
+    when(typeRegistry.resolve(eq("ОбщегоНазначения"), any(FileType.class)))
+      .thenReturn(Optional.of(MODULE));
+    when(typeRegistry.getMembers(eq(MODULE), any(FileType.class))).thenReturn(List.of(method));
+
+    // when / then
+    assertThat(index.resolveReferenceSymbol("ОбщегоНазначения.МойМетод", FileType.BSL))
+      .containsSame(sourceSymbol);
+  }
+
+  @Test
+  void resolveReferenceSymbolReturnsEmptyWhenMemberHasNoSourceSymbol() {
+    // given — член найден, но source-символа у него нет
+    var method = MemberDescriptor.method("МойМетод",
+      List.of(new SignatureDescriptor(List.of(), STRING, "")));
+    when(typeRegistry.resolve(eq("ОбщегоНазначения"), any(FileType.class)))
+      .thenReturn(Optional.of(MODULE));
+    when(typeRegistry.getMembers(eq(MODULE), any(FileType.class))).thenReturn(List.of(method));
+
+    // when / then
+    assertThat(index.resolveReferenceSymbol("ОбщегоНазначения.МойМетод", FileType.BSL)).isEmpty();
+  }
+
+  @Test
+  void resolveReferenceSymbolReturnsEmptyWhenMemberNotFound() {
+    // given — голова резолвится, но члена с таким именем нет
+    when(typeRegistry.resolve(eq("ОбщегоНазначения"), any(FileType.class)))
+      .thenReturn(Optional.of(MODULE));
+    when(typeRegistry.getMembers(eq(MODULE), any(FileType.class))).thenReturn(List.of());
+
+    // when / then
+    assertThat(index.resolveReferenceSymbol("ОбщегоНазначения.НеизвестныйМетод", FileType.BSL))
+      .isEmpty();
+  }
+
+  @Test
+  void resolveReferenceSymbolWalksNestedMembers() {
+    // given — Модуль.Поле.Метод: промежуточный сегмент Поле ведёт к типу Массив,
+    // на котором уже находится целевой Метод с source-символом.
+    var sourceSymbol = mock(SourceDefinedSymbol.class);
+    var field = MemberDescriptor.property("Поле", TypeSet.of(ARRAY), "");
+    var method = MemberDescriptor.method("Метод",
+      List.of(new SignatureDescriptor(List.of(), STRING, ""))).withSourceSymbol(sourceSymbol);
+    when(typeRegistry.resolve(eq("Модуль"), any(FileType.class))).thenReturn(Optional.of(MODULE));
+    when(typeRegistry.getMembers(eq(MODULE), any(FileType.class))).thenReturn(List.of(field));
+    when(typeRegistry.getMembers(eq(ARRAY), any(FileType.class))).thenReturn(List.of(method));
+
+    // when / then — резолв через короткий префикс «Модуль» и обход двух сегментов
+    assertThat(index.resolveReferenceSymbol("Модуль.Поле.Метод", FileType.BSL))
+      .containsSame(sourceSymbol);
   }
 }

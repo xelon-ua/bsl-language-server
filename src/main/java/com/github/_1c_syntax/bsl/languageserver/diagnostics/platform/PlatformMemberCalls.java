@@ -24,20 +24,24 @@ package com.github._1c_syntax.bsl.languageserver.diagnostics.platform;
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
 import com.github._1c_syntax.bsl.languageserver.types.TypeService;
 import com.github._1c_syntax.bsl.languageserver.types.TypeService.TypedMember;
+import com.github._1c_syntax.bsl.languageserver.types.model.PlatformMetadata;
+import com.github._1c_syntax.bsl.languageserver.types.model.TypeRef;
 import com.github._1c_syntax.bsl.languageserver.utils.Trees;
 import com.github._1c_syntax.bsl.parser.BSLParser;
-import org.antlr.v4.runtime.Token;
-import org.eclipse.lsp4j.Position;
+import org.antlr.v4.runtime.ParserRuleContext;
+import org.antlr.v4.runtime.tree.TerminalNode;
 import org.jspecify.annotations.Nullable;
 
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Резолв платформенных членов в сайтах вызовов модуля — общая база для
- * диагностик устаревания ({@code DeprecatedMethodCall}) и
- * недоступности-по-версии ({@code UnavailableMemberCall}). Версионная
- * применимость члена (устаревание/недоступность) вынесена в
+ * Резолв обращений к платформенному API в модуле — общая база для диагностик
+ * устаревания ({@code DeprecatedMethodCall}) и недоступности-по-версии
+ * ({@code UnavailableMemberCall}). Собирает два вида мест в коде: обращения к
+ * членам (вызов метода, обращение к свойству, вызов глобальной функции) и
+ * конструирование типов ({@code Новый Тип(…)}). Версионная применимость
+ * (устаревание/недоступность) вынесена в
  * {@link com.github._1c_syntax.bsl.languageserver.types.PlatformMemberVersions}.
  * <p>
  * Глобальные функции резолвятся напрямую (без инференса), поэтому собираются
@@ -46,6 +50,9 @@ import java.util.List;
  * дешёвый фильтр, после которого {@link TypeService#membersAt} выполняет
  * точный резолв члена на конкретном типе-владельце (иначе сработал бы
  * однофамилец с другого типа).
+ * <p>
+ * Форма {@code Новый("ИмяТипа", …)} не разбирается: имя типа там — значение
+ * выражения, вычисляемое в рантайме.
  */
 public final class PlatformMemberCalls {
 
@@ -60,28 +67,106 @@ public final class PlatformMemberCalls {
   }
 
   /**
-   * Собирает резолвленные платформенные члены во всех сайтах вызовов/обращений
-   * модуля. Для union-типа ресивера возвращаются все кандидаты-владельцы (по
-   * одному {@link TypedMember} на тип) с одинаковым диапазоном.
+   * Места обращения к платформенному API в одном модуле.
+   *
+   * @param members          резолвленные члены (метод, свойство, глобальная функция).
+   *                         Для union-типа ресивера возвращаются все кандидаты-владельцы
+   *                         (по одному {@link TypedMember} на тип) с одинаковым диапазоном.
+   * @param constructedTypes типы, конструируемые через {@code Новый Тип(…)}.
    */
-  public static List<TypedMember> collect(DocumentContext documentContext,
-                                          TypeService typeService) {
-    var ast = documentContext.getAst();
-    var result = new ArrayList<TypedMember>();
-    collectGlobalCalls(ast, documentContext, typeService, result);
-    collectVersionedMembers(ast, documentContext, typeService, result);
-    return result;
+  public record CallSites(List<TypedMember> members, List<ConstructedType> constructedTypes) {
   }
 
-  /** Глобальные вызовы — резолв дёшев (без инференса), без pre-filter'а по имени. */
-  private static void collectGlobalCalls(BSLParser.FileContext ast, DocumentContext documentContext,
-                                         TypeService typeService, List<TypedMember> sink) {
-    for (var node : Trees.findAllRuleNodes(ast, BSLParser.RULE_globalMethodCall)) {
-      var methodName = ((BSLParser.GlobalMethodCallContext) node).methodName();
-      if (methodName != null) {
-        resolveInto(sink, documentContext, typeService, methodName.getStart());
+  /**
+   * Конструируемый тип в одном выражении {@code Новый Тип(…)}.
+   *
+   * @param typeRef  резолвленный тип.
+   * @param typeName имя типа, как написано в коде (для сообщения диагностики).
+   * @param metadata «страничные» метаданные типа: версии появления/устаревания,
+   *                 рекомендуемые замены и т.д.
+   * @param node     узел имени типа — диапазон подсветки.
+   */
+  public record ConstructedType(
+    TypeRef typeRef,
+    String typeName,
+    PlatformMetadata metadata,
+    ParserRuleContext node
+  ) {
+  }
+
+  /**
+   * Собирает все места обращения к платформенному API модуля за один обход AST
+   * (раньше на каждый вид обращения был свой {@code findAllRuleNodes} — то есть
+   * отдельный полный обход дерева). Нерезолвленные имена пропускаются.
+   */
+  public static CallSites collect(DocumentContext documentContext, TypeService typeService) {
+    var ast = documentContext.getAst();
+    var members = new ArrayList<TypedMember>();
+    var constructedTypes = new ArrayList<ConstructedType>();
+    for (var node : Trees.findAllRuleNodes(ast,
+      BSLParser.RULE_globalMethodCall, BSLParser.RULE_methodCall, BSLParser.RULE_accessProperty,
+      BSLParser.RULE_newExpression)) {
+      collectSite(node, documentContext, typeService, members, constructedTypes);
+    }
+    return new CallSites(members, constructedTypes);
+  }
+
+  /** Резолв одного места вызова/обращения в зависимости от вида продукции. */
+  private static void collectSite(ParserRuleContext node, DocumentContext documentContext,
+                                  TypeService typeService, List<TypedMember> memberSink,
+                                  List<ConstructedType> constructedSink) {
+    switch (node) {
+      case BSLParser.GlobalMethodCallContext globalCall ->
+        resolveGlobalCall(globalCall, documentContext, typeService, memberSink);
+      case BSLParser.MethodCallContext methodCall ->
+        resolveMethodCall(methodCall, documentContext, typeService, memberSink);
+      case BSLParser.AccessPropertyContext accessProperty ->
+        resolveCandidate(accessProperty.IDENTIFIER(), documentContext, typeService, memberSink);
+      case BSLParser.NewExpressionContext newExpression ->
+        resolveConstructedType(newExpression, documentContext, typeService, constructedSink);
+      default -> {
+        // другие продукции в обход не запрашивались
       }
     }
+  }
+
+  /** Глобальный вызов: резолв дёшев (без инференса), поэтому без pre-filter'а по имени. */
+  private static void resolveGlobalCall(BSLParser.GlobalMethodCallContext globalCall,
+                                        DocumentContext documentContext, TypeService typeService,
+                                        List<TypedMember> sink) {
+    var methodName = globalCall.methodName();
+    if (methodName != null) {
+      resolveInto(sink, documentContext, typeService, methodName.IDENTIFIER());
+    }
+  }
+
+  /** Вызов метода на ресивере: имя проходит pre-filter, затем точный резолв на типе-владельце. */
+  private static void resolveMethodCall(BSLParser.MethodCallContext methodCall,
+                                        DocumentContext documentContext, TypeService typeService,
+                                        List<TypedMember> sink) {
+    var methodName = methodCall.methodName();
+    if (methodName != null) {
+      resolveCandidate(methodName.IDENTIFIER(), documentContext, typeService, sink);
+    }
+  }
+
+  /**
+   * Резолв конструируемого типа: имя типа из {@code Новый Тип(…)} + его
+   * «страничные» метаданные. Форма {@code Новый(«ИмяТипа»)} и неизвестные
+   * реестру имена пропускаются.
+   */
+  private static void resolveConstructedType(BSLParser.NewExpressionContext newExpression,
+                                             DocumentContext documentContext,
+                                             TypeService typeService,
+                                             List<ConstructedType> sink) {
+    var typeNameContext = newExpression.typeName();
+    if (typeNameContext == null) {
+      return;
+    }
+    var fileType = documentContext.getFileType();
+    var typeName = typeNameContext.getText();
+    typeService.resolve(typeName, fileType).ifPresent(typeRef -> sink.add(new ConstructedType(
+      typeRef, typeName, typeService.getTypeMetadata(typeRef, fileType), typeNameContext)));
   }
 
   /**
@@ -104,48 +189,30 @@ public final class PlatformMemberCalls {
   }
 
   /**
-   * Члены типов (метод/свойство) — с pre-filter'ом по имени.
-   * Включает версионные ({@link TypeService#isVersionedMemberName}) и
-   * следующие 1С-конвенции «устарело» (префикс «Удалить»). Остальные
-   * имена не резолвятся, чтобы не тратить инференс на каждый узел.
+   * Члены типов (метод/свойство) — с pre-filter'ом по имени. Резолвятся только
+   * версионные ({@link TypeService#isVersionedMemberName}) и следующие
+   * 1С-конвенции «устарело» (префикс «Удалить»); остальные имена пропускаются,
+   * чтобы не тратить инференс на каждый узел.
    */
-  private static void collectVersionedMembers(BSLParser.FileContext ast, DocumentContext documentContext,
-                                              TypeService typeService,
-                                              List<TypedMember> sink) {
-    for (var node : Trees.findAllRuleNodes(ast, BSLParser.RULE_methodCall)) {
-      var methodName = ((BSLParser.MethodCallContext) node).methodName();
-      if (methodName != null) {
-        resolveCandidate(methodName.getStart(), documentContext, typeService, sink);
-      }
-    }
-    for (var node : Trees.findAllRuleNodes(ast, BSLParser.RULE_accessProperty)) {
-      var identifier = ((BSLParser.AccessPropertyContext) node).IDENTIFIER();
-      if (identifier != null) {
-        resolveCandidate(identifier.getSymbol(), documentContext, typeService, sink);
-      }
-    }
-  }
-
-  private static void resolveCandidate(@Nullable Token token, DocumentContext documentContext,
+  private static void resolveCandidate(@Nullable TerminalNode terminal, DocumentContext documentContext,
                                        TypeService typeService,
                                        List<TypedMember> sink) {
-    if (token == null) {
+    if (terminal == null) {
       return;
     }
-    var text = token.getText();
+    var text = terminal.getText();
     if (typeService.isVersionedMemberName(text) || hasDeletedPrefix(text)) {
-      resolveInto(sink, documentContext, typeService, token);
+      resolveInto(sink, documentContext, typeService, terminal);
     }
   }
 
   private static void resolveInto(List<TypedMember> sink, DocumentContext documentContext,
-                                  TypeService typeService, @Nullable Token token) {
-    if (token == null) {
+                                  TypeService typeService, @Nullable TerminalNode terminal) {
+    if (terminal == null) {
       return;
     }
-    // Позиция начала идентификатора входит в его токен (start-inclusive),
-    // этого достаточно для membersAt.
-    var position = new Position(token.getLine() - 1, token.getCharPositionInLine());
-    sink.addAll(typeService.membersAt(documentContext, position));
+    // Терминал уже на руках из обхода — передаём его напрямую, минуя повторный
+    // спуск по AST для поиска терминала по позиции (доминирует на больших модулях).
+    sink.addAll(typeService.membersAt(documentContext, terminal));
   }
 }

@@ -32,7 +32,8 @@ import com.github._1c_syntax.bsl.languageserver.types.TypeService;
 import com.github._1c_syntax.bsl.languageserver.types.model.LocalField;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeRef;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeSet;
-import com.github._1c_syntax.bsl.languageserver.utils.Resources;
+import com.github._1c_syntax.bsl.languageserver.utils.NavigationLinks;
+import com.github._1c_syntax.bsl.languageserver.configuration.Resources;
 import com.github._1c_syntax.bsl.parser.description.ParameterDescription;
 import com.github._1c_syntax.bsl.parser.description.TypeDescription;
 import com.github._1c_syntax.bsl.parser.description.VariableDescription;
@@ -41,14 +42,17 @@ import org.eclipse.lsp4j.MarkupContent;
 import com.github._1c_syntax.bsl.languageserver.references.model.Reference;
 import org.eclipse.lsp4j.MarkupKind;
 import org.eclipse.lsp4j.SymbolKind;
+import org.jspecify.annotations.Nullable;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.Optional;
 import java.util.StringJoiner;
 import java.util.stream.Collectors;
@@ -64,6 +68,7 @@ public class VariableSymbolMarkupContentBuilder implements MarkupContentBuilder 
 
   private final LanguageServerConfiguration configuration;
   private final DescriptionFormatter descriptionFormatter;
+  private final EventContractFormatter eventContractFormatter;
   private final Resources resources;
   private final TypeService typeService;
 
@@ -85,8 +90,8 @@ public class VariableSymbolMarkupContentBuilder implements MarkupContentBuilder 
     var variableInfo = getVariableInfo(symbol);
     descriptionFormatter.addSectionIfNotEmpty(markupBuilder, variableInfo);
 
-    // тип (выведенный)
-    var typesInfo = getInferredTypes(symbol, typeService.typesAt(reference));
+    // тип в этой точке
+    var typesInfo = getTypes(symbol, typeService.typesAt(reference));
     descriptionFormatter.addSectionIfNotEmpty(markupBuilder, typesInfo);
 
     // местоположение переменной
@@ -95,7 +100,7 @@ public class VariableSymbolMarkupContentBuilder implements MarkupContentBuilder 
 
     // описание параметра из контракта события (для обработчиков платформенных
     // событий) — приоритетнее doc-комментария, который может устаревать
-    var eventParamDescription = descriptionFormatter.getEventHandlerParameterDescription(symbol);
+    var eventParamDescription = eventContractFormatter.getEventHandlerParameterDescription(symbol);
     if (eventParamDescription != null && !eventParamDescription.isBlank()) {
       descriptionFormatter.addSectionIfNotEmpty(markupBuilder, eventParamDescription);
     } else {
@@ -136,7 +141,14 @@ public class VariableSymbolMarkupContentBuilder implements MarkupContentBuilder 
     return resources.getResourceString(getClass(), key);
   }
 
-  private String getInferredTypes(VariableSymbol symbol, TypeSet types) {
+  /**
+   * Раздел типа переменной.
+   *
+   * @param symbol переменная.
+   * @param types  типы в точке обращения.
+   * @return текст раздела; пусто, если типов нет.
+   */
+  private String getTypes(VariableSymbol symbol, TypeSet types) {
     if (types.isEmpty()) {
       return "";
     }
@@ -153,7 +165,7 @@ public class VariableSymbolMarkupContentBuilder implements MarkupContentBuilder 
     // строка ТаблицыЗначений) рендерим маркдаун-списком под заголовком типа.
     // Описания (и недостающие ключи) подмешиваем из doc-комментария параметра.
     var bullets = new ArrayList<String>();
-    collectFieldBullets(bullets, types, lang, 0, docFieldIndex(symbol));
+    collectFieldBullets(bullets, types, lang, 0, docFieldIndex(symbol), new HashSet<>());
     if (!bullets.isEmpty()) {
       sb.append('\n');
       bullets.forEach(line -> sb.append('\n').append(line));
@@ -170,25 +182,23 @@ public class VariableSymbolMarkupContentBuilder implements MarkupContentBuilder 
    *
    * @param doc описания ключей из doc-комментария (имя ключа в нижнем регистре →
    *            тип/описание/вложенные ключи); пустая мапа, если документации нет.
+   * @param expandedSources функции-источники {@code см.}-ссылок, уже развёрнутые на
+   *            текущем пути обхода. Поле, тип которого снова приводит к одной из них,
+   *            не разворачивается повторно, а рендерится как {@code См. Функция} —
+   *            это и обрывает взаимную/само-рекурсию (Контейнер↔Коробка) без
+   *            искусственного лимита глубины.
    */
   private void collectFieldBullets(
-    List<String> out, TypeSet types, Language lang, int indent, Map<String, DocField> doc
+    List<String> out, TypeSet types, Language lang, int indent, Map<String, DocField> doc,
+    Set<Object> expandedSources
   ) {
     var pad = "  ".repeat(indent);
     var rendered = new HashSet<String>();
     for (var entry : collectFields(types).entrySet()) {
       var key = entry.getKey();
       rendered.add(key.toLowerCase(Locale.ROOT));
-      var field = entry.getValue();
-      var fieldTypes = field.types();
       var info = doc.get(key.toLowerCase(Locale.ROOT));
-      // Описание: приоритет у doc-комментария (для параметров), иначе — описание
-      // поля из модели типов (для локальной переменной из возврата функции).
-      var description = info != null && !info.description().isBlank()
-        ? info.description()
-        : cleanupKeyDescription(field.description());
-      out.add(fieldBullet(pad, key, fieldTypeLabel(fieldTypes, lang), description));
-      collectFieldBullets(out, fieldTypes, lang, indent + 1, info == null ? Map.of() : info.children());
+      renderInferredField(out, pad, key, entry.getValue(), types, lang, indent, info, expandedSources);
     }
     // Ключи, описанные в doc-комментарии, но не выведенные инференсером.
     for (var info : doc.values()) {
@@ -198,6 +208,42 @@ public class VariableSymbolMarkupContentBuilder implements MarkupContentBuilder 
       out.add(fieldBullet(pad, info.name(), info.typeLabel(), info.description()));
       collectDocOnlyBullets(out, info.children(), indent + 1);
     }
+  }
+
+  /**
+   * Отрендерить один выведенный инференсером ключ и, если он не образует цикла по
+   * см.-ссылке, рекурсивно развернуть его вложенные поля.
+   */
+  private void renderInferredField(List<String> out, String pad, String key, LocalField field,
+                                   TypeSet owner, Language lang, int indent, @Nullable DocField info,
+                                   Set<Object> expandedSources) {
+    var fieldTypes = field.types();
+    // Описание: приоритет у doc-комментария (для параметров), иначе — описание
+    // поля из модели типов (для локальной переменной из возврата функции).
+    var description = info != null && !info.description().isBlank()
+      ? info.description()
+      : cleanupKeyDescription(field.description());
+
+    // Функция-источник см.-ссылки, разворот которой даёт вложенные поля этого
+    // ключа: собственная ленивая ссылка поля (`Содержимое - см. Коробка`), либо —
+    // для коллекций — ленивый элемент (`Массив из см. Узел`). Именно её имя нужно
+    // показать при обрыве цикла, а не источники уровнем глубже.
+    var fieldSources = fieldExpansionSources(owner, key, fieldTypes);
+    var cyclic = !fieldSources.isEmpty() && !Collections.disjoint(fieldSources, expandedSources);
+    var seeLabel = cyclic ? seeReferenceLabel(fieldSources, lang) : "";
+    var typeLabel = seeLabel.isBlank() ? fieldTypeLabel(fieldTypes, lang) : seeLabel;
+
+    out.add(fieldBullet(pad, key, typeLabel, description));
+    if (cyclic) {
+      return;
+    }
+    var nextSources = expandedSources;
+    if (!fieldSources.isEmpty()) {
+      nextSources = new HashSet<>(expandedSources);
+      nextSources.addAll(fieldSources);
+    }
+    collectFieldBullets(out, fieldTypes, lang, indent + 1,
+      info == null ? Map.of() : info.children(), nextSources);
   }
 
   /**
@@ -219,6 +265,63 @@ public class VariableSymbolMarkupContentBuilder implements MarkupContentBuilder 
       }
     }
     return fields;
+  }
+
+  /**
+   * Функции-источники см.-ссылки, разворот которой даёт вложенные поля ключа
+   * {@code key} объекта {@code owner}. Это либо собственная ленивая ссылка поля
+   * (поле {@code owner.lazyFields[key]}), либо — если поле эагерное, но его тип —
+   * коллекция с ленивым элементом — источник этого элемента. Возвращаемые ключи и
+   * обнаруживают цикл, и дают имя для метки {@code См. Функция}.
+   */
+  private static Set<Object> fieldExpansionSources(TypeSet owner, String key, TypeSet fieldTypes) {
+    var ownSource = lazyFieldSource(owner, key);
+    if (ownSource != null) {
+      return Set.of(ownSource);
+    }
+    var elementKeys = new HashSet<>();
+    fieldTypes.lazyElements().values().forEach(lazy -> elementKeys.add(lazy.key()));
+    return elementKeys;
+  }
+
+  /** Ключ собственной ленивой см.-ссылки поля {@code name} в наборе типов, либо {@code null}. */
+  private static @Nullable Object lazyFieldSource(TypeSet owner, String name) {
+    for (var byName : owner.lazyFields().values()) {
+      for (var entry : byName.entrySet()) {
+        if (entry.getKey().equalsIgnoreCase(name)) {
+          return entry.getValue().types().key();
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Метка {@code См. Функция} для поля, чей тип задан {@code см.}-ссылкой,
+   * образующей цикл. Пустая строка, если имя источника извлечь не удалось
+   * (тогда вызывающий покажет обычную метку типа).
+   */
+  private static String seeReferenceLabel(Set<Object> sources, Language lang) {
+    var prefix = lang == Language.EN ? "See " : "См. ";
+    var names = sources.stream()
+      .map(VariableSymbolMarkupContentBuilder::sourceLink)
+      .filter(link -> !link.isBlank())
+      .distinct()
+      .sorted()
+      .collect(Collectors.joining(" | "));
+    return names.isBlank() ? "" : (prefix + names);
+  }
+
+  /**
+   * Имя функции-источника {@code см.}-ссылки как markdown-гиперссылка на её
+   * определение; пустая строка, если источник не является символом с позицией.
+   */
+  private static String sourceLink(Object key) {
+    if (!(key instanceof MethodSymbol method)) {
+      return "";
+    }
+    var target = NavigationLinks.toTarget(method.getOwner().getUri(), method.getSelectionRange());
+    return "[%s](%s)".formatted(method.getName(), target);
   }
 
   /** markdown-метка типов значения поля: имена в кавычках, объединение через {@code |}. */

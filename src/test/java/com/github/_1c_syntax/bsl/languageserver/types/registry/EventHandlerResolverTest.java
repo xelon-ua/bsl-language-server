@@ -28,6 +28,7 @@ import com.github._1c_syntax.bsl.context.api.ContextProvider;
 import com.github._1c_syntax.bsl.context.platform.PlatformGlobalContext;
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
 import com.github._1c_syntax.bsl.languageserver.context.FileType;
+import com.github._1c_syntax.bsl.languageserver.types.model.BilingualString;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberKind;
 import com.github._1c_syntax.bsl.languageserver.types.model.SignatureDescriptor;
@@ -36,17 +37,22 @@ import com.github._1c_syntax.bsl.languageserver.types.model.TypeRef;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeSet;
 import com.github._1c_syntax.bsl.types.ModuleType;
 import org.junit.jupiter.api.Test;
-import org.mockito.Mockito;
 
 import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.anyString;
+import static org.mockito.Mockito.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
 
 class EventHandlerResolverTest {
 
-  private final TypeRegistry typeRegistry = Mockito.mock(TypeRegistry.class);
-  private final BslContextHolder bslContextHolder = Mockito.mock(BslContextHolder.class);
+  private final TypeRegistry typeRegistry = mock(TypeRegistry.class);
+  private final BslContextHolder bslContextHolder = mock(BslContextHolder.class);
   private final EventHandlerResolver resolver = new EventHandlerResolver(typeRegistry, bslContextHolder);
 
   @Test
@@ -104,14 +110,14 @@ class EventHandlerResolverTest {
 
     resolver.lookupContract(doc, "ПриСозданииОбъекта");
 
-    Mockito.verifyNoInteractions(typeRegistry);
+    verifyNoInteractions(typeRegistry);
   }
 
   @Test
   void globalModuleWithoutHbkReturnsEmpty() {
-    Mockito.when(bslContextHolder.get()).thenReturn(Optional.empty());
-    var doc = Mockito.mock(DocumentContext.class);
-    Mockito.when(doc.getModuleType()).thenReturn(ModuleType.SessionModule);
+    when(bslContextHolder.get()).thenReturn(Optional.empty());
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.SessionModule);
 
     var contract = resolver.lookupContract(doc, "УстановкаПараметровСеанса");
 
@@ -119,25 +125,25 @@ class EventHandlerResolverTest {
   }
 
   private static DocumentContext oscriptClassDoc() {
-    var doc = Mockito.mock(DocumentContext.class);
-    Mockito.when(doc.getModuleType()).thenReturn(ModuleType.OScriptClass);
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.OScriptClass);
     return doc;
   }
 
   @Test
   void globalModuleWithHbkResolvesEventByName() {
     var event = stubEvent("ПередНачаломРаботыСистемы", "BeforeStart");
-    var globalContext = Mockito.mock(PlatformGlobalContext.class);
-    Mockito.when(globalContext.applicationEvents()).thenReturn(List.of(event));
-    Mockito.when(globalContext.ordinaryApplicationEvents()).thenReturn(List.of());
-    Mockito.when(globalContext.sessionModuleEvents()).thenReturn(List.of());
-    Mockito.when(globalContext.externalConnectionModuleEvents()).thenReturn(List.of());
-    var provider = Mockito.mock(ContextProvider.class);
-    Mockito.when(provider.getGlobalContext()).thenReturn(globalContext);
-    Mockito.when(bslContextHolder.get()).thenReturn(Optional.of(provider));
+    var globalContext = mock(PlatformGlobalContext.class);
+    when(globalContext.applicationEvents()).thenReturn(List.of(event));
+    when(globalContext.ordinaryApplicationEvents()).thenReturn(List.of());
+    when(globalContext.sessionModuleEvents()).thenReturn(List.of());
+    when(globalContext.externalConnectionModuleEvents()).thenReturn(List.of());
+    var provider = mock(ContextProvider.class);
+    when(provider.getGlobalContext()).thenReturn(globalContext);
+    when(bslContextHolder.get()).thenReturn(Optional.of(provider));
 
-    var doc = Mockito.mock(DocumentContext.class);
-    Mockito.when(doc.getModuleType()).thenReturn(ModuleType.ManagedApplicationModule);
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.ManagedApplicationModule);
 
     // По ru-имени и по en-алиасу должны находить один и тот же контракт.
     assertThat(resolver.lookupContract(doc, "ПередНачаломРаботыСистемы")).isPresent();
@@ -147,18 +153,44 @@ class EventHandlerResolverTest {
   }
 
   @Test
-  void globalModuleEmptyEventListReturnsEmpty() {
-    var globalContext = Mockito.mock(PlatformGlobalContext.class);
-    Mockito.when(globalContext.applicationEvents()).thenReturn(List.of());
-    Mockito.when(globalContext.ordinaryApplicationEvents()).thenReturn(List.of());
-    Mockito.when(globalContext.sessionModuleEvents()).thenReturn(List.of());
-    Mockito.when(globalContext.externalConnectionModuleEvents()).thenReturn(List.of());
-    var provider = Mockito.mock(ContextProvider.class);
-    Mockito.when(provider.getGlobalContext()).thenReturn(globalContext);
-    Mockito.when(bslContextHolder.get()).thenReturn(Optional.of(provider));
+  void globalEventsCachedAfterFirstBuild() {
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.ManagedApplicationModule);
 
-    var doc = Mockito.mock(DocumentContext.class);
-    Mockito.when(doc.getModuleType()).thenReturn(ModuleType.OrdinaryApplicationModule);
+    // 1) Провайдер доступен — карта глобальных событий собирается и кэшируется при первом обращении.
+    var event = stubEvent("ПередНачаломРаботыСистемы", "BeforeStart");
+    var globalContext = mock(PlatformGlobalContext.class);
+    when(globalContext.applicationEvents()).thenReturn(List.of(event));
+    when(globalContext.ordinaryApplicationEvents()).thenReturn(List.of());
+    when(globalContext.sessionModuleEvents()).thenReturn(List.of());
+    when(globalContext.externalConnectionModuleEvents()).thenReturn(List.of());
+    var provider = mock(ContextProvider.class);
+    when(provider.getGlobalContext()).thenReturn(globalContext);
+    when(bslContextHolder.get()).thenReturn(Optional.of(provider));
+
+    assertThat(resolver.allEvents(doc)).isNotEmpty();
+
+    // 2) Результат закэширован: даже если провайдер потом «пропадёт», ранее собранная карта
+    // остаётся (BslContextHolder в проде синхронно-мемоизирован и не меняется, поэтому кэшировать
+    // безусловно, включая пустоту, безопасно — см. EventHandlerResolver#globalEvents).
+    when(bslContextHolder.get()).thenReturn(Optional.empty());
+    assertThat(resolver.lookupContract(doc, "ПередНачаломРаботыСистемы")).isPresent();
+    assertThat(resolver.allEvents(doc)).isNotEmpty();
+  }
+
+  @Test
+  void globalModuleEmptyEventListReturnsEmpty() {
+    var globalContext = mock(PlatformGlobalContext.class);
+    when(globalContext.applicationEvents()).thenReturn(List.of());
+    when(globalContext.ordinaryApplicationEvents()).thenReturn(List.of());
+    when(globalContext.sessionModuleEvents()).thenReturn(List.of());
+    when(globalContext.externalConnectionModuleEvents()).thenReturn(List.of());
+    var provider = mock(ContextProvider.class);
+    when(provider.getGlobalContext()).thenReturn(globalContext);
+    when(bslContextHolder.get()).thenReturn(Optional.of(provider));
+
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.OrdinaryApplicationModule);
 
     assertThat(resolver.lookupContract(doc, "Что-то")).isEmpty();
   }
@@ -167,26 +199,49 @@ class EventHandlerResolverTest {
   void commandModuleResolvesViaFixedOwnerType() {
     // CommandModule идёт через MODULE_TYPE_TO_FIXED_OWNER_RU = "Модуль команды".
     var commandRef = new TypeRef(TypeKind.PLATFORM, "Модуль команды");
-    Mockito.when(typeRegistry.resolve("Модуль команды")).thenReturn(Optional.of(commandRef));
+    when(typeRegistry.resolve("Модуль команды")).thenReturn(Optional.of(commandRef));
     var eventDescriptor = MemberDescriptor.event(
       "ОбработкаКоманды", "",
       List.of(new SignatureDescriptor(List.of(), TypeSet.EMPTY, "")));
-    Mockito.when(typeRegistry.getMembers(Mockito.eq(commandRef), Mockito.any()))
+    when(typeRegistry.getMembers(eq(commandRef), any()))
       .thenReturn(List.of(eventDescriptor));
 
-    var doc = Mockito.mock(DocumentContext.class);
-    Mockito.when(doc.getModuleType()).thenReturn(ModuleType.CommandModule);
-    Mockito.when(doc.getFileType()).thenReturn(FileType.BSL);
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.CommandModule);
+    when(doc.getFileType()).thenReturn(FileType.BSL);
 
     assertThat(resolver.lookupContract(doc, "ОбработкаКоманды")).isPresent();
     assertThat(resolver.lookupContract(doc, "ЧтоТоЕщё")).isEmpty();
   }
 
   @Test
+  void ownerTypeEventResolvesByEnglishAliasNotJustRuPrimaryName() {
+    var objectRef = new TypeRef(TypeKind.CONFIGURATION, "ДокументОбъект.Заказ");
+    when(typeRegistry.resolve("ДокументОбъект.Заказ")).thenReturn(Optional.of(objectRef));
+    var eventDescriptor = MemberDescriptor.event(
+        "ПередЗаписью", "",
+        List.of(new SignatureDescriptor(List.of(), TypeSet.EMPTY, "")))
+      .withBilingualName(BilingualString.of("ПередЗаписью", "BeforeWrite"));
+    when(typeRegistry.getMembers(eq(objectRef), any()))
+      .thenReturn(List.of(eventDescriptor));
+
+    var document = com.github._1c_syntax.bsl.mdo.Document.builder().name("Заказ").build();
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.ObjectModule);
+    when(doc.getMdObject()).thenReturn(Optional.of(document));
+    when(doc.getFileType()).thenReturn(FileType.BSL);
+
+    assertThat(resolver.lookupContract(doc, "ПередЗаписью")).isPresent();
+    assertThat(resolver.lookupContract(doc, "BeforeWrite")).isPresent();
+    assertThat(resolver.lookupContract(doc, "beforewrite")).isPresent();
+    assertThat(resolver.lookupContract(doc, "СлучайноеИмя")).isEmpty();
+  }
+
+  @Test
   void fixedOwnerTypeAbsentInRegistryReturnsEmpty() {
-    Mockito.when(typeRegistry.resolve(Mockito.anyString())).thenReturn(Optional.empty());
-    var doc = Mockito.mock(DocumentContext.class);
-    Mockito.when(doc.getModuleType()).thenReturn(ModuleType.HTTPServiceModule);
+    when(typeRegistry.resolve(anyString())).thenReturn(Optional.empty());
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.HTTPServiceModule);
 
     assertThat(resolver.lookupContract(doc, "ЛюбоеИмя")).isEmpty();
   }
@@ -196,9 +251,9 @@ class EventHandlerResolverTest {
     // mdoSpecificQualifiedName возвращает empty при пустом name MDO —
     // строим реальный Catalog с пустым именем.
     var catalog = com.github._1c_syntax.bsl.mdo.Catalog.builder().name("").build();
-    var doc = Mockito.mock(DocumentContext.class);
-    Mockito.when(doc.getModuleType()).thenReturn(ModuleType.ObjectModule);
-    Mockito.when(doc.getMdObject()).thenReturn(Optional.of(catalog));
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.ObjectModule);
+    when(doc.getMdObject()).thenReturn(Optional.of(catalog));
 
     assertThat(resolver.lookupContract(doc, "ПриЗаписи")).isEmpty();
   }
@@ -206,31 +261,118 @@ class EventHandlerResolverTest {
   @Test
   void mdoSpecificOwnerWithoutMdObjectReturnsEmpty() {
     // ObjectModule → ищем mdObject; если его нет — empty.
-    var doc = Mockito.mock(DocumentContext.class);
-    Mockito.when(doc.getModuleType()).thenReturn(ModuleType.ObjectModule);
-    Mockito.when(doc.getMdObject()).thenReturn(Optional.empty());
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.ObjectModule);
+    when(doc.getMdObject()).thenReturn(Optional.empty());
 
     assertThat(resolver.lookupContract(doc, "ПриЗаписи")).isEmpty();
   }
 
   @Test
   void unsupportedModuleTypeReturnsEmpty() {
-    var doc = Mockito.mock(DocumentContext.class);
-    Mockito.when(doc.getModuleType()).thenReturn(ModuleType.CommonModule);
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.CommonModule);
 
     assertThat(resolver.lookupContract(doc, "ПриЗаписи")).isEmpty();
   }
 
+  /**
+   * Осознанное ограничение (не баг): обработчики форм не резолвятся. Форма — единственный
+   * {@link ModuleType}, у которого события декларируются не по имени, а в {@code Form.xml}
+   * (блок {@code <Events>}), это отдельная, не начатая задача (см. javadoc класса). Явный тест
+   * фиксирует контракт, чтобы отсутствие резолва для форм не осталось молчаливым и не
+   * воспринималось как забытый кейс при последующих правках.
+   */
+  @Test
+  void formModuleIsNotResolvedByDesign() {
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.FormModule);
+
+    assertThat(resolver.lookupContract(doc, "ПриОткрытии")).isEmpty();
+    assertThat(resolver.allEvents(doc)).isEmpty();
+    verifyNoInteractions(typeRegistry);
+  }
+
+  @Test
+  void allEventsForOScriptClassReturnsBuiltinEvents() {
+    var doc = oscriptClassDoc();
+
+    var events = resolver.allEvents(doc);
+
+    assertThat(events)
+      .extracting(MemberDescriptor::name)
+      .containsExactlyInAnyOrder("ПриСозданииОбъекта", "ОбработкаПолученияПредставления");
+  }
+
+  @Test
+  void allEventsForGlobalModuleDedupsRuEnAliases() {
+    var event = stubEvent("ПередНачаломРаботыСистемы", "BeforeStart");
+    var globalContext = mock(PlatformGlobalContext.class);
+    when(globalContext.applicationEvents()).thenReturn(List.of(event));
+    when(globalContext.ordinaryApplicationEvents()).thenReturn(List.of());
+    when(globalContext.sessionModuleEvents()).thenReturn(List.of());
+    when(globalContext.externalConnectionModuleEvents()).thenReturn(List.of());
+    var provider = mock(ContextProvider.class);
+    when(provider.getGlobalContext()).thenReturn(globalContext);
+    when(bslContextHolder.get()).thenReturn(Optional.of(provider));
+
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.ManagedApplicationModule);
+
+    // Событие лежит в карте под ru- и en-ключом на один и тот же объект — в allEvents() должно
+    // остаться единственное вхождение, а не два дубля.
+    assertThat(resolver.allEvents(doc))
+      .hasSize(1)
+      .extracting(MemberDescriptor::name)
+      .containsExactly("ПередНачаломРаботыСистемы");
+  }
+
+  @Test
+  void allEventsForGlobalModuleWithoutHbkReturnsEmpty() {
+    when(bslContextHolder.get()).thenReturn(Optional.empty());
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.SessionModule);
+
+    assertThat(resolver.allEvents(doc)).isEmpty();
+  }
+
+  @Test
+  void allEventsForMdoSpecificOwnerFiltersByEventKind() {
+    var eventDescriptor = MemberDescriptor.event(
+      "ПриЗаписи", "", List.of(new SignatureDescriptor(List.of(), TypeSet.EMPTY, "")));
+    var methodDescriptor = MemberDescriptor.method("Записать");
+    var commandRef = new TypeRef(TypeKind.PLATFORM, "Модуль команды");
+    when(typeRegistry.resolve("Модуль команды")).thenReturn(Optional.of(commandRef));
+    when(typeRegistry.getMembers(eq(commandRef), any()))
+      .thenReturn(List.of(eventDescriptor, methodDescriptor));
+
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.CommandModule);
+    when(doc.getFileType()).thenReturn(FileType.BSL);
+
+    assertThat(resolver.allEvents(doc))
+      .extracting(MemberDescriptor::name)
+      .containsExactly("ПриЗаписи");
+  }
+
+  @Test
+  void allEventsForUnsupportedModuleTypeReturnsEmpty() {
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.CommonModule);
+
+    assertThat(resolver.allEvents(doc)).isEmpty();
+  }
+
   private static ContextEvent stubEvent(String ru, String en) {
-    var event = Mockito.mock(ContextEvent.class);
+    var event = mock(ContextEvent.class);
     var name = new ContextName(ru, en);
-    Mockito.when(event.name()).thenReturn(name);
-    Mockito.when(event.signatures()).thenReturn(List.of());
-    Mockito.when(event.description()).thenReturn("");
-    Mockito.when(event.availabilities()).thenReturn(List.<Availability>of());
-    Mockito.when(event.sinceVersion()).thenReturn("");
-    Mockito.when(event.deprecatedSinceVersion()).thenReturn("");
-    Mockito.when(event.recommendedReplacements()).thenReturn(List.of());
+    when(event.name()).thenReturn(name);
+    when(event.signatures()).thenReturn(List.of());
+    when(event.description()).thenReturn("");
+    when(event.availabilities()).thenReturn(List.<Availability>of());
+    when(event.sinceVersion()).thenReturn("");
+    when(event.deprecatedSinceVersion()).thenReturn("");
+    when(event.recommendedReplacements()).thenReturn(List.of());
     return event;
   }
 }

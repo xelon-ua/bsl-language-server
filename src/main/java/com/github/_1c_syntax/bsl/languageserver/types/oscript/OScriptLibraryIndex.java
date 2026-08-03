@@ -22,9 +22,11 @@
 package com.github._1c_syntax.bsl.languageserver.types.oscript;
 
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
+import com.github._1c_syntax.bsl.languageserver.context.OScriptModuleTypeResolver;
 import com.github._1c_syntax.bsl.languageserver.context.ServerContext;
+import com.github._1c_syntax.bsl.languageserver.context.ServerContextProvider;
 import com.github._1c_syntax.bsl.languageserver.context.events.ServerContextDocumentRemovedEvent;
-import com.github._1c_syntax.bsl.languageserver.context.events.WorkspaceAddedEvent;
+import com.github._1c_syntax.bsl.languageserver.events.WorkspaceAddedEvent;
 import com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceScope;
 import com.github._1c_syntax.bsl.types.ModuleType;
 import com.github._1c_syntax.utils.Absolute;
@@ -76,10 +78,10 @@ import java.util.concurrent.ConcurrentHashMap;
 @RequiredArgsConstructor
 public class OScriptLibraryIndex {
 
-  private final LibConfigDiscovery libConfigDiscovery;
   private final LibConfigParser libConfigParser;
-  private final ConventionalLibraryDiscovery conventionalLibraryDiscovery;
+  private final OScriptLibraryScanner oScriptLibraryScanner;
   private final OScriptModuleTypeResolver oScriptModuleTypeResolver;
+  private final ServerContextProvider serverContextProvider;
   // Материализуем members-provider в том же workspace-scope: иначе его
   // @EventListener'ы не подпишутся до того, как мы начнём rebuildDocument().
   private final OScriptModuleMembersProvider oScriptModuleMembersProvider;
@@ -114,14 +116,15 @@ public class OScriptLibraryIndex {
 
   @EventListener
   public void handleWorkspaceAdded(WorkspaceAddedEvent event) {
-    var serverContext = event.getServerContext();
+    var workspaceUri = event.getWorkspaceUri();
+    var serverContext = serverContextProvider.getServerContextUnsafe(workspaceUri).orElse(null);
     if (serverContext == null) {
       return;
     }
     try {
       reindex(serverContext);
     } catch (RuntimeException e) {
-      LOGGER.warn("OScript library indexing failed for workspace {}", event.getWorkspaceUri(), e);
+      LOGGER.warn("OScript library indexing failed for workspace {}", workspaceUri, e);
     }
   }
 
@@ -137,7 +140,10 @@ public class OScriptLibraryIndex {
     entriesByUri.clear();
     entriesByName.clear();
 
-    var configs = libConfigDiscovery.discover(serverContext);
+    // Единый обход дерева: и lib.config-манифесты, и convention/flat-библиотеки.
+    var discovery = oScriptLibraryScanner.scan(serverContext);
+
+    var configs = discovery.libConfigs();
     if (!configs.isEmpty()) {
       LOGGER.debug("Indexing {} OneScript library manifest(s)", configs.size());
       for (var libConfigPath : configs) {
@@ -145,7 +151,7 @@ public class OScriptLibraryIndex {
       }
     }
 
-    var conventional = conventionalLibraryDiscovery.discover(serverContext, configs);
+    var conventional = discovery.conventionalLibraries();
     if (!conventional.isEmpty()) {
       LOGGER.debug("Indexing {} convention-based OneScript librar(y/ies)", conventional.size());
       for (var lib : conventional) {
@@ -307,7 +313,7 @@ public class OScriptLibraryIndex {
    * Глубина рекурсивного обхода каталога-библиотеки для сбора implicit-записей
    * ({@code .os} в convention-каталогах {@code Классы}/{@code Classes}/
    * {@code Модули}/{@code Modules}, не объявленных в манифесте). Чуть больше,
-   * чем у {@link LibConfigDiscovery}/{@link ConventionalLibraryDiscovery},
+   * чем у {@link OScriptLibraryScanner},
    * чтобы дотянуться до структур вида {@code src/<подсистема>/Классы/...} с
    * запасом.
    */
@@ -337,7 +343,7 @@ public class OScriptLibraryIndex {
             return FileVisitResult.CONTINUE;
           }
           var name = dir.getFileName().toString();
-          if (LibConfigDiscovery.OSCRIPT_MODULES_DIRNAME.equals(name)) {
+          if (OScriptLibraryRootResolver.OSCRIPT_MODULES_DIRNAME.equals(name)) {
             return FileVisitResult.SKIP_SUBTREE;
           }
           return FileVisitResult.CONTINUE;
@@ -346,7 +352,7 @@ public class OScriptLibraryIndex {
         @Override
         public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
           var fileName = file.getFileName().toString();
-          if (!fileName.toLowerCase(Locale.ROOT).endsWith(ConventionalLibraryDiscovery.OS_SUFFIX)) {
+          if (!fileName.toLowerCase(Locale.ROOT).endsWith(DirContents.OS_SUFFIX)) {
             return FileVisitResult.CONTINUE;
           }
           var parent = file.getParent();

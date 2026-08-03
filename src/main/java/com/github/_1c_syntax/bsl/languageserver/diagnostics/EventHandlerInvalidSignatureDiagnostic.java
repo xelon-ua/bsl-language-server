@@ -22,12 +22,12 @@
 package com.github._1c_syntax.bsl.languageserver.diagnostics;
 
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
+import com.github._1c_syntax.bsl.languageserver.context.symbol.EventMethodSymbol;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.MethodSymbol;
 import com.github._1c_syntax.bsl.languageserver.diagnostics.metadata.DiagnosticMetadata;
 import com.github._1c_syntax.bsl.languageserver.diagnostics.metadata.DiagnosticSeverity;
 import com.github._1c_syntax.bsl.languageserver.diagnostics.metadata.DiagnosticTag;
 import com.github._1c_syntax.bsl.languageserver.diagnostics.metadata.DiagnosticType;
-import com.github._1c_syntax.bsl.languageserver.providers.CodeActionProvider;
 import com.github._1c_syntax.bsl.languageserver.types.index.EventContractsIndex;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.ParameterDescriptor;
@@ -76,12 +76,13 @@ public class EventHandlerInvalidSignatureDiagnostic extends AbstractDiagnostic i
 
   @Override
   public void check() {
-    documentContext.getSymbolTree().getMethods().forEach(method ->
-      eventContractsIndex.getContract(documentContext, method.getName())
-        .map(MemberDescriptor::signatures)
-        .filter(signatures -> !signatures.isEmpty())
-        .ifPresent(signatures -> checkSignature(method, signatures))
-    );
+    documentContext.getSymbolTree().getMethods().stream()
+      .filter(EventMethodSymbol.class::isInstance)
+      .forEach(method ->
+        eventContractsIndex.getContract(documentContext, method.getName())
+          .map(MemberDescriptor::signatures)
+          .filter(signatures -> !signatures.isEmpty())
+          .ifPresent(signatures -> checkSignature(method, signatures)));
   }
 
   /**
@@ -145,7 +146,7 @@ public class EventHandlerInvalidSignatureDiagnostic extends AbstractDiagnostic i
     if (textEdits.isEmpty()) {
       return List.of();
     }
-    return CodeActionProvider.createCodeActions(
+    return QuickFixProvider.createCodeActions(
       textEdits, info.getResourceString("quickFixMessage"),
       documentContext.getUri(), fixedDiagnostics);
   }

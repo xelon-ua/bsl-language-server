@@ -34,14 +34,16 @@ import com.github._1c_syntax.bsl.parser.BSLParser;
 import lombok.RequiredArgsConstructor;
 import org.antlr.v4.runtime.tree.ParseTree;
 import org.antlr.v4.runtime.tree.TerminalNode;
-import org.eclipse.lsp4j.Position;
 import org.jspecify.annotations.Nullable;
 
 import java.util.Optional;
 
 /**
  * Подсвечивает присваивание значению в свойство, у которого режим доступа —
- * {@link AccessMode#READ}.
+ * {@link AccessMode#READ}. Покрывает и дотовый доступ ({@code получатель.Свойство = …}),
+ * и голое обращение к self-члену типа модуля ({@code Свойство = …} — например, присваивание
+ * стандартному реквизиту {@code Ссылка} в модуле объекта), кроме случая, когда имя затенено
+ * одноимённой локальной переменной/параметром.
  * <p>
  * Источник информации о режиме доступа — синтакс-помощник платформы 1С
  * (через {@code bsl-context}) или JSON-fallback. Метаданные пробрасываются
@@ -54,7 +56,7 @@ import java.util.Optional;
  *   <li>{@link TypeService#hasAnyReadOnlyMember()} — глобальный гейт.
  *       Без HBK / без accessMode-данных диагностика моментально no-op.</li>
  *   <li>{@link TypeService#memberAt(com.github._1c_syntax.bsl.languageserver.context.DocumentContext,
- *       Position)} — точный резолв member'а с учётом инференции типа
+ *       TerminalNode)} — точный резолв member'а с учётом инференции типа
  *       ресивера (глобальное свойство, локальная переменная, цепочка
  *       аксессоров). Резолв bilingual: read-only находится независимо от
  *       того, на каком языке (ru/en) записано имя свойства.</li>
@@ -102,15 +104,14 @@ public class AssignToReadOnlyPropertyDiagnostic extends AbstractVisitorDiagnosti
       return Optional.empty();
     }
     var lValue = ctx.lValue();
-    if (lValue == null || lValue.acceptor() == null) {
+    if (lValue == null) {
       return Optional.empty();
     }
-    var accessProperty = lValue.acceptor().accessProperty();
-    var propertyId = accessProperty == null ? null : accessProperty.IDENTIFIER();
+    var propertyId = assignedPropertyId(lValue);
     if (propertyId == null) {
       return Optional.empty();
     }
-    var member = typeService.memberAt(documentContext, positionInside(propertyId))
+    var member = typeService.memberAt(documentContext, propertyId)
       .map(TypedMember::descriptor)
       .orElse(null);
     if (member == null || member.kind() != MemberKind.PROPERTY
@@ -120,10 +121,25 @@ public class AssignToReadOnlyPropertyDiagnostic extends AbstractVisitorDiagnosti
     return Optional.of(propertyId);
   }
 
-  private static Position positionInside(TerminalNode terminal) {
-    var token = terminal.getSymbol();
-    var col = token.getCharPositionInLine();
-    var len = token.getText().length();
-    return new Position(token.getLine() - 1, col + Math.max(0, len / 2));
+  /**
+   * Терминал присваиваемого свойства:
+   * <ul>
+   *   <li>дотовый доступ {@code получатель.Свойство} — идентификатор после точки;</li>
+   *   <li>голый идентификатор {@code Свойство} — обращение к self-члену типа модуля
+   *       (реквизиту объекта/набора записей/менеджера). Затенение одноимённой
+   *       локальной переменной/параметром здесь не проверяется — его учитывает сам
+   *       резолв self-члена ({@code TypeService.resolveSelfMember}): затенённое имя
+   *       членом не считается, поэтому {@link TypeService#memberAt} ниже вернёт empty.</li>
+   * </ul>
+   *
+   * @return терминал-идентификатор свойства, либо {@code null}, если lValue им не является.
+   */
+  private static @Nullable TerminalNode assignedPropertyId(BSLParser.LValueContext lValue) {
+    var acceptor = lValue.acceptor();
+    if (acceptor != null) {
+      var accessProperty = acceptor.accessProperty();
+      return accessProperty == null ? null : accessProperty.IDENTIFIER();
+    }
+    return lValue.IDENTIFIER();
   }
 }

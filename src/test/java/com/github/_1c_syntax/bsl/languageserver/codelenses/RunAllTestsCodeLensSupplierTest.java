@@ -21,10 +21,10 @@
  */
 package com.github._1c_syntax.bsl.languageserver.codelenses;
 
-import com.github._1c_syntax.bsl.languageserver.ClientCapabilitiesHolder;
+import com.github._1c_syntax.bsl.languageserver.client.ClientCapabilitiesHolder;
 import com.github._1c_syntax.bsl.languageserver.codelenses.testrunner.TestRunnerAdapter;
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
-import com.github._1c_syntax.bsl.languageserver.events.LanguageServerInitializeRequestReceivedEvent;
+import com.github._1c_syntax.bsl.languageserver.events.LanguageServerInitializedEvent;
 import com.github._1c_syntax.bsl.languageserver.util.CleanupContextBeforeClassAndAfterEachTestMethod;
 import com.github._1c_syntax.bsl.languageserver.util.TestUtils;
 import org.eclipse.lsp4j.ClientInfo;
@@ -109,6 +109,7 @@ class RunAllTestsCodeLensSupplierTest {
 
     // then
     assertThat(resolvedCodeLens.getCommand()).isNotNull();
+    assertThat(resolvedCodeLens.getCommand().getTooltip()).isNotBlank();
   }
 
   private void initializeServer(String clientName) {
@@ -118,7 +119,7 @@ class RunAllTestsCodeLensSupplierTest {
 
     clientCapabilitiesHolder.setClientInfo(clientInfo);
 
-    var event = new LanguageServerInitializeRequestReceivedEvent(
+    var event = new LanguageServerInitializedEvent(
       mock(LanguageServer.class),
       initializeParams
     );

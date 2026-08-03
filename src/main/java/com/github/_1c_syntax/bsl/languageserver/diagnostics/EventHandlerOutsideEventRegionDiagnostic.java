@@ -22,6 +22,7 @@
 package com.github._1c_syntax.bsl.languageserver.diagnostics;
 
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
+import com.github._1c_syntax.bsl.languageserver.context.symbol.EventMethodSymbol;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.MethodSymbol;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.RegionSymbol;
 import com.github._1c_syntax.bsl.languageserver.diagnostics.metadata.DiagnosticMetadata;
@@ -29,12 +30,12 @@ import com.github._1c_syntax.bsl.languageserver.diagnostics.metadata.DiagnosticS
 import com.github._1c_syntax.bsl.languageserver.diagnostics.metadata.DiagnosticSeverity;
 import com.github._1c_syntax.bsl.languageserver.diagnostics.metadata.DiagnosticTag;
 import com.github._1c_syntax.bsl.languageserver.diagnostics.metadata.DiagnosticType;
-import com.github._1c_syntax.bsl.languageserver.providers.CodeActionProvider;
-import com.github._1c_syntax.bsl.languageserver.types.index.EventContractsIndex;
+import com.github._1c_syntax.bsl.languageserver.types.registry.FormHandlerRoleIndex;
 import com.github._1c_syntax.bsl.languageserver.utils.Keywords;
 import com.github._1c_syntax.bsl.languageserver.utils.Ranges;
 import com.github._1c_syntax.bsl.types.ModuleType;
 import org.eclipse.lsp4j.CodeAction;
+import org.jspecify.annotations.Nullable;
 import org.eclipse.lsp4j.CodeActionParams;
 import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.Position;
@@ -43,9 +44,7 @@ import org.eclipse.lsp4j.TextEdit;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.Optional;
-import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -64,62 +63,71 @@ import java.util.stream.Collectors;
 )
 public class EventHandlerOutsideEventRegionDiagnostic extends AbstractDiagnostic implements QuickFixProvider {
 
-  /**
-   * Имена областей-«обработчиков событий» по стандарту std455 — ru/en.
-   * Сравнение регистронезависимое; на форме допустимы расширенные варианты
-   * ({@code ОбработчикиСобытийФормы}, {@code ОбработчикиСобытийЭлементов*}),
-   * проверяем по префиксу.
-   */
-  private static final String OBJECT_TARGET_REGION = Keywords.EVENT_HANDLERS_REGION.getRu();
-  private static final String FORM_TARGET_REGION = Keywords.FORM_EVENT_HANDLERS_REGION.getRu();
+  private final FormHandlerRoleIndex formHandlerRoleIndex;
 
-  private static final Set<String> OBJECT_EVENT_REGIONS = Set.of(
-    Keywords.EVENT_HANDLERS_REGION.getRu(),
-    Keywords.EVENT_HANDLERS_REGION.getEn()
-  );
-
-  private static final Set<String> FORM_EVENT_REGION_PREFIXES = Set.of(
-    Keywords.FORM_EVENT_HANDLERS_REGION.getRu(),
-    Keywords.FORM_HEADER_ITEMS_EVENT_HANDLERS_REGION.getRu(),
-    Keywords.FORM_TABLE_ITEMS_EVENT_HANDLERS_REGION_START.getRu(),
-    Keywords.FORM_EVENT_HANDLERS_REGION.getEn(),
-    Keywords.FORM_HEADER_ITEMS_EVENT_HANDLERS_REGION.getEn(),
-    Keywords.FORM_TABLE_ITEMS_EVENT_HANDLERS_REGION_START.getEn()
-  );
-
-  private final EventContractsIndex eventContractsIndex;
-
-  public EventHandlerOutsideEventRegionDiagnostic(EventContractsIndex eventContractsIndex) {
-    this.eventContractsIndex = eventContractsIndex;
+  public EventHandlerOutsideEventRegionDiagnostic(FormHandlerRoleIndex formHandlerRoleIndex) {
+    this.formHandlerRoleIndex = formHandlerRoleIndex;
   }
 
   @Override
   public void check() {
-    var isFormModule = documentContext.getModuleType() == ModuleType.FormModule;
     documentContext.getSymbolTree().getMethods().stream()
-      .filter(this::isEventHandler)
-      .filter(method -> !isInEventRegion(method, isFormModule))
-      .forEach(method -> diagnosticStorage.addDiagnostic(method.getSubNameRange(),
-        info.getMessage(method.getName())));
+      .filter(EventMethodSymbol.class::isInstance)
+      .forEach(this::checkMethod);
   }
 
-  private boolean isEventHandler(MethodSymbol method) {
-    return eventContractsIndex.getContract(documentContext, method.getName()).isPresent();
+  private void checkMethod(MethodSymbol method) {
+    var expectedRegion = expectedRegion(method, documentContext);
+    if (isInEventRegion(method, expectedRegion, documentContext)) {
+      return;
+    }
+    // Имя области — на языке модуля, а не интерфейса: его пользователю писать в коде.
+    var regionName = EventHandlerTargetRegion.orFallback(expectedRegion)
+      .forLanguage(documentContext.getScriptVariantLanguage());
+    diagnosticStorage.addDiagnostic(method.getSubNameRange(),
+      info.getMessage(method.getName(), regionName));
   }
 
-  private static boolean isInEventRegion(MethodSymbol method, boolean isFormModule) {
+  /**
+   * Область, в которой обработчик обязан лежать по стандарту. У модуля формы она
+   * зависит от того, кем обработчик объявлен: событие формы, событие элемента шапки,
+   * событие элемента таблицы и действие команды живут в разных областях.
+   * <p>
+   * Документ передаётся параметром, а не берётся из поля: на пути quick fix'а поле не
+   * заполнено — там контекст приходит аргументом.
+   *
+   * @return имя области; пусто, если модуль формы, а объявитель обработчика неизвестен —
+   *   тогда годится любая из форменных областей.
+   */
+  private @Nullable EventHandlerTargetRegion expectedRegion(MethodSymbol method,
+                                                            DocumentContext documentContext) {
+    if (documentContext.getModuleType() != ModuleType.FormModule) {
+      return EventHandlerTargetRegion.OBJECT;
+    }
+    return formHandlerRoleIndex.roleOf(documentContext, method.getName())
+      .map(EventHandlerTargetRegion::of)
+      .orElse(null);
+  }
+
+  /**
+   * Лежит ли метод там, где положено. Если конкретная область известна — сравниваем
+   * с ней (в обеих локалях), иначе принимаем любую область обработчиков.
+   */
+  private static boolean isInEventRegion(MethodSymbol method,
+                                         @Nullable EventHandlerTargetRegion expectedRegion,
+                                         DocumentContext documentContext) {
     var regionOpt = method.getRegion();
     if (regionOpt.isEmpty()) {
       return false;
     }
-    var regionName = regionOpt.get().getName().toLowerCase(Locale.ROOT);
-    return isFormModule
-      ? FORM_EVENT_REGION_PREFIXES.stream()
-        .map(p -> p.toLowerCase(Locale.ROOT))
-        .anyMatch(regionName::startsWith)
-      : OBJECT_EVENT_REGIONS.stream()
-        .map(r -> r.toLowerCase(Locale.ROOT))
-        .anyMatch(regionName::equals);
+    var regionName = regionOpt.get().getName();
+    if (expectedRegion == null) {
+      return EventHandlerTargetRegion.isAnyFormRegion(regionName);
+    }
+    if (documentContext.getModuleType() != ModuleType.FormModule) {
+      return EventHandlerTargetRegion.OBJECT.matches(regionName);
+    }
+    return expectedRegion.matches(regionName);
   }
 
   @Override
@@ -153,8 +161,11 @@ public class EventHandlerOutsideEventRegionDiagnostic extends AbstractDiagnostic
     if (methodTexts.isEmpty()) {
       return List.of();
     }
-    var targetRegion = documentContext.getModuleType() == ModuleType.FormModule
-      ? FORM_TARGET_REGION : OBJECT_TARGET_REGION;
+    // Область берётся по первому методу: fix-all группирует методы одной области,
+    // а разные роли дают разные области — их правки не смешиваются.
+    var language = documentContext.getScriptVariantLanguage();
+    var targetRegion = EventHandlerTargetRegion
+      .orFallback(expectedRegion(methods.get(0), documentContext)).forLanguage(language);
     var existingRegion = findRegionByName(documentContext, targetRegion);
     if (existingRegion.isPresent()) {
       var insertPos = positionBeforeEndRegion(existingRegion.get());
@@ -171,12 +182,15 @@ public class EventHandlerOutsideEventRegionDiagnostic extends AbstractDiagnostic
       var anchor = newRegionInsertPosition(documentContext);
       var leading = needsLeadingBlank(anchor.getLine(), contentList) ? "\n" : "";
       var body = String.join("\n\n", methodTexts);
-      var insertText = leading + "#Область " + targetRegion + "\n\n"
-        + body + "\n\n#КонецОбласти\n";
+      // Директивы — в варианте встроенного языка конфигурации. Компилируются оба
+      // написания, но создавать мы обязаны на том языке, на котором пишет проект.
+      var languageCode = language.getLanguageCode();
+      var insertText = leading + "#" + Keywords.REGION.get(languageCode) + " " + targetRegion + "\n\n"
+        + body + "\n\n#" + Keywords.ENDREGION.get(languageCode) + "\n";
       textEdits.add(new TextEdit(new Range(anchor, anchor), insertText));
     }
 
-    return CodeActionProvider.createCodeActions(
+    return QuickFixProvider.createCodeActions(
       textEdits, info.getResourceString("quickFixMessage"),
       documentContext.getUri(), fixedDiagnostics);
   }

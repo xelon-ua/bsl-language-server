@@ -23,27 +23,26 @@ package com.github._1c_syntax.bsl.languageserver.hover;
 
 import com.github._1c_syntax.bsl.languageserver.configuration.Language;
 import com.github._1c_syntax.bsl.languageserver.configuration.LanguageServerConfiguration;
-import com.github._1c_syntax.bsl.languageserver.types.model.BilingualString;
+import com.github._1c_syntax.bsl.languageserver.context.FileType;
+import com.github._1c_syntax.bsl.languageserver.types.registry.BslContextPlatformTypesProvider;
 import com.github._1c_syntax.bsl.languageserver.types.registry.TypeRegistry;
-import com.github._1c_syntax.bsl.languageserver.types.model.AccessMode;
-import com.github._1c_syntax.bsl.languageserver.types.model.Availability;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberKind;
-import com.github._1c_syntax.bsl.languageserver.types.model.PlatformMetadata;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeSet;
 import com.github._1c_syntax.bsl.languageserver.types.model.SignatureDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeRef;
 import com.github._1c_syntax.bsl.languageserver.types.util.SignatureSelection;
-import com.github._1c_syntax.bsl.languageserver.utils.Resources;
+import com.github._1c_syntax.bsl.languageserver.configuration.Resources;
 import lombok.RequiredArgsConstructor;
 import org.eclipse.lsp4j.MarkupContent;
 import org.eclipse.lsp4j.MarkupKind;
 import org.jspecify.annotations.Nullable;
 import org.springframework.stereotype.Component;
 
-import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
+import java.util.Locale;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -58,9 +57,18 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class PlatformMemberHoverBuilder {
 
+  /**
+   * Пробельный участок, внутри которого есть хотя бы один перенос строки: и одиночный
+   * перенос, и пустая строка между абзацами (см. {@link #asListItemLines}). Записан без
+   * вложенных квантификаторов — {@code (?:[ \t]*\R)*} внутри повторения даёт
+   * экспоненциальный откат на длинном тексте.
+   */
+  private static final Pattern LINE_BREAKS = Pattern.compile("[ \\t]*\\R\\s*");
+
   private final Resources resources;
   private final LanguageServerConfiguration configuration;
   private final TypeRegistry typeRegistry;
+  private final PlatformMetadataRenderer metadataRenderer;
 
   private String tr(String key) {
     return resources.getResourceString(getClass(), key);
@@ -147,6 +155,7 @@ public class PlatformMemberHoverBuilder {
         sb.append(": ").append(typeRegistry.displayName(descriptor.returnType(), lang));
       }
       sb.append("\n```\n");
+      appendOpenStructureFields(sb, descriptor.returnTypes(), lang);
     }
     if (owner != null) {
       sb.append("\n_").append(tr("memberOf")).append("_ `")
@@ -197,10 +206,9 @@ public class PlatformMemberHoverBuilder {
         sb.append('\n');
       }
     }
-    appendMetadata(sb, descriptor.metadata());
-    if (chosen != null && !chosen.description().isBlank()) {
-      // returnValueDescription уже зашит в общий description выше
-    }
+    // Описание возвращаемого значения отдельно не печатается: оно уже входит
+    // в блок метаданных выше (PlatformMetadata.returnValueDescription).
+    metadataRenderer.append(sb, descriptor.metadata());
     if (disclaim) {
       sb.append("\n\n_").append(tr("noMatchingSignature")).append('_');
     }
@@ -234,91 +242,69 @@ public class PlatformMemberHoverBuilder {
   }
 
   /**
-   * Отрисовывает блок платформенных метаданных: «доступно с …», «устарело с …»,
-   * рекомендуемые замены, режим доступа, контексты исполнения, описание
-   * возвращаемого значения, «Замечание», примеры, «См. также».
-   * Если метаданные пусты — ничего не пишет.
+   * Дописывает состав свойств «открытой структуры» маркдаун-списком — так же, как
+   * hover переменной показывает поля {@code Структура}. Типы, у которых состав
+   * свойств не объявлен конфигурацией (см. {@code TypeRegistry#isOpenStructure}),
+   * пропускаются: у них полезно имя типа, а не перечисление сотен членов.
    */
-  private void appendMetadata(StringBuilder sb, PlatformMetadata md) {
-    if (md == null || md.isEmpty()) {
+  private void appendOpenStructureFields(StringBuilder sb, TypeSet types, Language lang) {
+    if (types == null || types.isEmpty()) {
       return;
     }
-    if (!md.deprecatedSinceVersion().isBlank()) {
-      sb.append("\n\n**").append(tr("deprecatedSince")).append("** ").append(md.deprecatedSinceVersion());
-    }
-    if (!md.sinceVersion().isBlank()) {
-      sb.append("\n\n**").append(tr("sinceVersion")).append("** ").append(md.sinceVersion());
-    }
-    if (!md.recommendedReplacements().isEmpty()) {
-      sb.append("\n\n**").append(tr("recommendedReplacements")).append("** ")
-        .append(md.recommendedReplacements().stream()
-          .map(r -> "`" + r + "`")
-          .collect(Collectors.joining(", ")));
-    }
-    if (md.accessMode() == AccessMode.READ) {
-      sb.append("\n\n**").append(tr("accessMode")).append("** ").append(tr("accessReadOnly"));
-    } else if (md.accessMode() == AccessMode.READ_WRITE) {
-      sb.append("\n\n**").append(tr("accessMode")).append("** ").append(tr("accessReadWrite"));
-    }
-    appendAvailabilities(sb, md.availabilities());
-    var lang = configuration.getLanguage();
-    var rv = md.returnValueDescription().forLanguage(lang);
-    if (!rv.isBlank()) {
-      sb.append("\n\n**").append(tr("returnValueDescription")).append("** ").append(rv);
-    }
-    var nt = md.notes().forLanguage(lang);
-    if (!nt.isBlank()) {
-      sb.append("\n\n**").append(tr("notes")).append("** ").append(nt);
-    }
-    appendBilingualList(sb, tr("example"), md.examples(), true, lang);
-    appendBilingualList(sb, tr("seeAlso"), md.seeAlso(), false, lang);
-  }
-
-  private static void appendBilingualList(StringBuilder sb, String title,
-                                          List<BilingualString> items, boolean asCodeBlock,
-                                          Language lang) {
-    if (items == null || items.isEmpty()) {
-      return;
-    }
-    var resolved = new ArrayList<String>(items.size());
-    for (var bi : items) {
-      var s = bi.forLanguage(lang);
-      if (s != null && !s.isBlank()) {
-        resolved.add(s);
-      }
-    }
-    appendList(sb, title, resolved, asCodeBlock);
-  }
-
-  private void appendAvailabilities(StringBuilder sb, Set<Availability> availabilities) {
-    if (availabilities == null || availabilities.isEmpty()) {
-      return;
-    }
-    sb.append("\n\n**").append(tr("availabilities")).append("** ");
-    sb.append(availabilities.stream()
-      .map(this::displayName)
-      .collect(Collectors.joining(", ")));
-  }
-
-  private String displayName(Availability availability) {
-    return tr("availability." + availability.name());
-  }
-
-  private static void appendList(StringBuilder sb, String title, List<String> items, boolean asCodeBlock) {
-    if (items == null || items.isEmpty()) {
-      return;
-    }
-    sb.append("\n\n**").append(title).append(":**");
-    for (var item : items) {
-      if (item == null || item.isBlank()) {
+    var keyMarker = BslContextPlatformTypesProvider.KEY_PARAMETER_MARKER.forLanguage(lang);
+    for (var ref : types.refs()) {
+      var base = typeRegistry.openStructureBase(ref);
+      if (base.isEmpty()) {
         continue;
       }
-      if (asCodeBlock) {
-        sb.append("\n\n```bsl\n").append(item).append("\n```");
-      } else {
-        sb.append("\n- ").append(item);
+      // Члены базового платформенного типа (`Свойство`, `ИсходныйКлючЗаписи`) полями
+      // не являются: конфигурация их не объявляла, и в списке они только мешают.
+      var inherited = new HashSet<String>();
+      for (var member : typeRegistry.getMembers(base.get(), FileType.BSL)) {
+        inherited.add(member.name().toLowerCase(Locale.ROOT));
+      }
+      for (var member : typeRegistry.getMembers(ref, FileType.BSL)) {
+        if (member.kind() == MemberKind.PROPERTY
+          && !inherited.contains(member.name().toLowerCase(Locale.ROOT))) {
+          appendFieldLine(sb, member, keyMarker, lang);
+        }
       }
     }
+  }
+
+  /**
+   * Одно поле «открытой структуры» пунктом списка. Ключевой параметр набран курсивом:
+   * признак «по нему форма ищется среди уже открытых» важнее прочего текста и должен
+   * читаться до описания.
+   */
+  private void appendFieldLine(StringBuilder sb, MemberDescriptor member, String keyMarker, Language lang) {
+    var description = member.displayDescription(lang);
+    var key = description.stripTrailing().endsWith(keyMarker);
+    if (key) {
+      description = description.stripTrailing();
+      description = description.substring(0, description.length() - keyMarker.length());
+    }
+    var name = member.displayName(lang);
+    sb.append("\n* ").append(key ? "***" + name + "***" : "**" + name + "**");
+    var typeLabel = renderTypeSet(member.returnTypes(), lang);
+    if (!typeLabel.isEmpty()) {
+      sb.append(": ").append(typeLabel);
+    }
+    var text = asListItemLines(description);
+    if (!text.isBlank()) {
+      sb.append(" — ").append(text);
+    }
+  }
+
+  /**
+   * Готовит многоабзацный текст к вставке внутрь пункта markdown-списка: переносы
+   * сохраняются, но становятся «жёсткими» (два пробела в конце строки) и получают
+   * отступ по ширине маркера. Без этого продолжение выходит из пункта и встаёт
+   * отдельным абзацем, теряя привязку к своему полю; пустые строки между абзацами
+   * убираются — в списке они смотрятся разрывом.
+   */
+  private static String asListItemLines(String text) {
+    return LINE_BREAKS.matcher(text.strip()).replaceAll("  \n  ");
   }
 
   /**

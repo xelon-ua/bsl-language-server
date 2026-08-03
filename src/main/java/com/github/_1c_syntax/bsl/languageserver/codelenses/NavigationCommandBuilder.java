@@ -21,8 +21,8 @@
  */
 package com.github._1c_syntax.bsl.languageserver.codelenses;
 
-import com.github._1c_syntax.bsl.languageserver.ClientCapabilitiesHolder;
-import com.github._1c_syntax.bsl.languageserver.events.LanguageServerInitializeRequestReceivedEvent;
+import com.github._1c_syntax.bsl.languageserver.client.ClientCapabilitiesHolder;
+import com.github._1c_syntax.bsl.languageserver.events.LanguageServerInitializedEvent;
 import lombok.RequiredArgsConstructor;
 import org.eclipse.lsp4j.Command;
 import org.eclipse.lsp4j.Location;
@@ -71,13 +71,13 @@ public class NavigationCommandBuilder {
 
   /**
    * Закэшированный признак клиента на базе VS Code. Вычисляется один раз при
-   * получении {@link LanguageServerInitializeRequestReceivedEvent}, чтобы не
+   * получении {@link LanguageServerInitializedEvent}, чтобы не
    * читать {@link ClientCapabilitiesHolder} на каждый запрос линзы.
    */
   private boolean vsCodeLikeClient;
 
   /**
-   * Обработчик события {@link LanguageServerInitializeRequestReceivedEvent}.
+   * Обработчик события {@link LanguageServerInitializedEvent}.
    * <p>
    * Один раз определяет и кэширует тип подключённого клиента: в момент события
    * {@link ClientCapabilitiesHolder} уже содержит {@code ClientInfo}.
@@ -85,39 +85,43 @@ public class NavigationCommandBuilder {
    * @param event Событие получения запроса инициализации.
    */
   @EventListener
-  public void handleInitializeEvent(LanguageServerInitializeRequestReceivedEvent event) {
+  public void handleInitializeEvent(LanguageServerInitializedEvent event) {
     vsCodeLikeClient = clientCapabilitiesHolder.isVsCodeLikeClient();
   }
 
   /**
-   * Команда перехода к производителю(-ям): прыжок к единственной цели, поповер при нескольких.
-   * Подходит прямой линзе «точка внедрения → производитель».
+   * Команда перехода к целям с подсказкой (tooltip), показываемой при наведении на линзу.
    *
    * @param title    Заголовок линзы.
+   * @param tooltip  Подсказка при наведении.
    * @param uri      URI документа, из которого выполняется переход.
    * @param position Позиция курсора, от которой выполняется переход.
    * @param targets  Цели перехода (объявления производителей).
    * @return Команда с идентификатором, выбранным под клиента.
    */
-  public Command gotoCommand(String title, URI uri, Position position, List<Location> targets) {
+  public Command gotoCommand(String title, String tooltip, URI uri, Position position, List<Location> targets) {
     var multiple = targets.size() == 1 ? MULTIPLE_GOTO : MULTIPLE_PEEK;
     var commandId = isVsCodeLike() ? VS_CODE_GOTO_COMMAND : BUILTIN_GOTO_COMMAND;
-    return new Command(title, commandId, List.of(uri.toString(), position, targets, multiple));
+    var command = new Command(title, commandId, List.of(uri.toString(), position, targets, multiple));
+    command.setTooltip(tooltip);
+    return command;
   }
 
   /**
-   * Команда показа списка использований в поповере. Подходит обратной линзе
-   * «производитель → точки внедрения».
+   * Команда показа списка использований в поповере с подсказкой (tooltip) при наведении на линзу.
    *
    * @param title     Заголовок линзы.
+   * @param tooltip   Подсказка при наведении.
    * @param uri       URI документа, из которого выполняется показ.
    * @param position  Позиция курсора, от которой выполняется показ.
    * @param locations Местоположения использований.
    * @return Команда с идентификатором, выбранным под клиента.
    */
-  public Command referencesCommand(String title, URI uri, Position position, List<Location> locations) {
+  public Command referencesCommand(String title, String tooltip, URI uri, Position position, List<Location> locations) {
     var commandId = isVsCodeLike() ? VS_CODE_REFERENCES_COMMAND : BUILTIN_REFERENCES_COMMAND;
-    return new Command(title, commandId, List.of(uri.toString(), position, locations));
+    var command = new Command(title, commandId, List.of(uri.toString(), position, locations));
+    command.setTooltip(tooltip);
+    return command;
   }
 
   /**

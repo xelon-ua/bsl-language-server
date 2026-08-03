@@ -21,11 +21,12 @@
  */
 package com.github._1c_syntax.bsl.languageserver.providers;
 
-import com.github._1c_syntax.bsl.languageserver.ClientCapabilitiesHolder;
-import com.github._1c_syntax.bsl.languageserver.LanguageClientHolder;
+import com.github._1c_syntax.bsl.languageserver.client.ClientCapabilitiesHolder;
+import com.github._1c_syntax.bsl.languageserver.client.LanguageClientHolder;
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
 import com.github._1c_syntax.bsl.languageserver.context.ServerContext;
 import com.github._1c_syntax.bsl.languageserver.context.ServerContextProvider;
+import com.github._1c_syntax.bsl.languageserver.context.events.ConfigurationTypesRegisteredEvent;
 import com.github._1c_syntax.bsl.languageserver.context.events.ServerContextPopulatedEvent;
 import com.github._1c_syntax.bsl.languageserver.references.ReferenceIndexFiller;
 import com.github._1c_syntax.bsl.languageserver.semantictokens.SemanticTokenEntry;
@@ -567,7 +568,7 @@ class SemanticTokensProviderTest {
       // Line 9: Функция keyword
       new ExpectedToken(9, 0, 7, SemanticTokenTypes.Keyword, "Функция"),
       // Line 9: ПроверитьДанные function name
-      new ExpectedToken(9, 8, 15, SemanticTokenTypes.Function, "ПроверитьДанные"),
+      new ExpectedToken(9, 8, 15, SemanticTokenTypes.Method, "ПроверитьДанные"),
       // Line 9: ( operator
       new ExpectedToken(9, 23, 1, SemanticTokenTypes.Operator, "("),
       // Line 9: Имя parameter definition
@@ -1978,6 +1979,40 @@ class SemanticTokensProviderTest {
 
     // then
     assertThatNoException().isThrownBy(() -> provider.handleServerContextPopulated(event));
+  }
+
+  @Test
+  void testSemanticTokensRefreshOnConfigurationTypesRegistered() {
+    // Self-члены (реквизиты/платформенные методы объекта и т.п.) резолвятся
+    // через self-тип, который регистрируется позже ServerContextPopulatedEvent —
+    // без отдельного refresh на этом событии подсветка открытого до регистрации
+    // документа осталась бы устаревшей до следующей правки файла.
+    // given
+    var languageClient = mock(LanguageClient.class);
+    clientHolder.connect(languageClient);
+
+    prepareSemanticTokensRefreshSupport(true);
+
+    // when
+    applicationEventPublisher.publishEvent(new ConfigurationTypesRegisteredEvent(serverContext));
+
+    // then
+    verify(languageClient).refreshSemanticTokens();
+  }
+
+  @Test
+  void testSemanticTokensDoNotRefreshOnConfigurationTypesRegistered_ifClientDoesNotSupportRefresh() {
+    // given
+    var languageClient = mock(LanguageClient.class);
+    clientHolder.connect(languageClient);
+
+    prepareSemanticTokensRefreshSupport(false);
+
+    // when
+    applicationEventPublisher.publishEvent(new ConfigurationTypesRegisteredEvent(serverContext));
+
+    // then
+    verify(languageClient, never()).refreshSemanticTokens();
   }
 
   private void prepareSemanticTokensRefreshSupport(boolean refreshSupport) {

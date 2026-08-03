@@ -16,13 +16,13 @@ plugins {
     id("io.freefair.javadoc-utf-8") version "9.5.0"
     id("io.freefair.aspectj.post-compile-weaving") version "9.5.0"
     id("io.freefair.maven-central.validate-poms") version "9.5.0"
-    id("com.github.ben-manes.versions") version "0.54.0"
+    id("com.github.ben-manes.versions") version "0.58.0"
     id("org.springframework.boot") version "4.1.0"
     id("io.spring.dependency-management") version "1.1.7"
-    id("io.sentry.jvm.gradle") version "6.12.0"
-    id("io.github.1c-syntax.bslls-dev-tools") version "0.8.1"
+    id("io.sentry.jvm.gradle") version "6.17.0"
+    id("io.github.1c-syntax.bslls-dev-tools") version "0.8.2"
     id("ru.vyarus.pom") version "3.0.0"
-    id("org.jreleaser") version "1.24.0"
+    id("org.jreleaser") version "1.25.0"
     id("org.sonarqube") version "7.3.1.8318"
     id("me.champeau.jmh") version "0.7.3"
     id("com.gorylenko.gradle-git-properties") version "4.0.1"
@@ -42,21 +42,21 @@ gitVersioning.apply {
     refs {
         describeTagFirstParent = false
         tag("v(?<tagVersion>[0-9].*)") {
-            version = $$"${ref.tagVersion}${dirty}"
+            version = "\${ref.tagVersion}\${dirty}"
         }
 
         branch("develop") {
-            version = $$"${describe.tag.version}." +
-                    $$"${describe.distance}-SNAPSHOT${dirty}"
+            version = "\${describe.tag.version}." +
+                    "\${describe.distance}-SNAPSHOT\${dirty}"
         }
 
         branch(".+") {
-            version = $$"${ref}-${commit.short}${dirty}"
+            version = "\${ref}-\${commit.short}\${dirty}"
         }
     }
 
     rev {
-        version = $$"${commit.short}${dirty}"
+        version = "\${commit.short}\${dirty}"
     }
 }
 
@@ -96,15 +96,15 @@ dependencies {
     api("org.springframework.ai:spring-ai-starter-mcp-server-webmvc")
 
     // 1c-syntax
-    api("io.github.1c-syntax:bsl-parser:0.37.1")
-    api("io.github.1c-syntax:utils:0.7.2")
-    api("io.github.1c-syntax:mdclasses:0.19.1")
-    api("io.github.1c-syntax:bsl-common-library:0.11.0")
-    api("io.github.1c-syntax:supportconf:0.16.0")
-    api("io.github.1c-syntax:bsl-context:0.7.0")
+    api("io.github.1c-syntax:bsl-parser:0.39.0")
+    api("io.github.1c-syntax:utils:0.10.1")
+    api("io.github.1c-syntax:mdclasses:0.19.0.82-SNAPSHOT")
+    api("io.github.1c-syntax:bsl-common-library:0.12.4")
+    api("io.github.1c-syntax:supportconf:0.17.1")
+    api("io.github.1c-syntax:bsl-context:0.9.2")
 
     // nullability annotations
-    api("org.jspecify:jspecify:1.0.0")
+    api("org.jspecify:jspecify:1.0.1")
 
     // JLanguageTool
     implementation("org.languagetool:languagetool-core:$languageToolVersion") {
@@ -131,13 +131,13 @@ dependencies {
     implementation("commons-beanutils:commons-beanutils:1.11.0") {
         exclude("commons-logging", "commons-logging")
     }
-    implementation("commons-codec:commons-codec:1.22.0")
+    implementation("commons-codec:commons-codec:1.22.1")
     implementation("org.apache.commons:commons-lang3:3.20.0")
     implementation("org.apache.commons:commons-collections4:4.5.0")
     implementation("org.apache.commons:commons-exec:1.6.0")
 
     // JGit
-    implementation("org.eclipse.jgit:org.eclipse.jgit:7.7.0.202606012155-r")
+    implementation("org.eclipse.jgit:org.eclipse.jgit:7.7.1.202607240634-r")
 
     // progress bar
     implementation("me.tongfei:progressbar:0.10.2")
@@ -172,8 +172,11 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter")
 
     // test utils
-    testImplementation("com.github.hazendaz.jmockit:jmockit:2.2.0")
+    testImplementation("com.github.hazendaz.jmockit:jmockit:2.3.0")
     testImplementation("org.awaitility:awaitility:4.3.0")
+
+    // архитектурные тесты (проверка конвенций именования/аннотаций/зависимостей)
+    testImplementation("com.tngtech.archunit:archunit-junit5:1.4.2")
 
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
@@ -193,7 +196,7 @@ tasks.withType<JavaCompile> {
 
 tasks.jar {
     manifest {
-        attributes["Main-Class"] = "com.github._1c_syntax.bsl.languageserver.BSLLSPLauncher"
+        attributes["Main-Class"] = "com.github._1c_syntax.bsl.languageserver.MainApplication"
         attributes["Implementation-Version"] = archiveVersion.get()
     }
     enabled = true
@@ -245,11 +248,19 @@ tasks.test {
         html.required.set(true)
     }
 
+    val isCi = System.getenv("CI") == "true" || System.getenv("GITHUB_ACTIONS") == "true"
+
     // Increase heap size to prevent OOM during test execution.
     // With CleanupContextBeforeClassAndAfterClass tests causing frequent Spring context reloads,
     // multiple contexts can be in memory simultaneously (old being GC'd while new is created).
-    // 3g gives enough headroom on GitHub Actions ubuntu-latest runners with 1 fork.
-    maxHeapSize = "3g"
+    //
+    // На CI все 650+ классов идут в одном форке, и туда же попадает импорт всех классов
+    // проекта в ArchitectureTest (ArchUnit строит граф целиком). Когда он выпадает после
+    // серии перезагрузок контекста, 3g перестаёт хватать: `build (25, ubuntu-latest)`
+    // валился `OutOfMemoryError: Java heap space` в `ClassGraphCreator`. У раннера 16 ГБ,
+    // форк один — 4g снимают вопрос. Локально форков до четырёх, поэтому там остаётся 3g:
+    // 4 × 4g не влезут в машину с 16 ГБ.
+    maxHeapSize = if (isCi) "4g" else "3g"
 
     // Параллельное выполнение тестов JUnit на уровне процессов (форков JVM).
     // Использование форков, а не потоков, обусловлено тем, что многие тесты
@@ -264,7 +275,6 @@ tasks.test {
     // чтобы не упереться в OOM при `maxHeapSize=3g` на каждый форк.
     // Локально — половина доступных процессоров, ограниченная диапазоном
     // от 1 до 4.
-    val isCi = System.getenv("CI") == "true" || System.getenv("GITHUB_ACTIONS") == "true"
     maxParallelForks = (project.findProperty("maxParallelForks") as String?)?.toIntOrNull()
         ?: if (isCi) 1 else (Runtime.getRuntime().availableProcessors() / 2).coerceIn(1, 4)
 
@@ -312,6 +322,19 @@ jmh {
     jmhVersion = "1.37"
 }
 
+// Дерево зависимостей проекта даёт в jmh-архиве больше 65535 записей — нужен zip64.
+tasks.named<Jar>("jmhJar") {
+    isZip64 = true
+}
+
+// Грамматики bsl-parser собраны форком ANTLR (io.github.1c-syntax:antlr4) с несовместимой
+// версией сериализации ATN. В обычном classpath выигрывает форк, а при склейке uber-jar
+// классы апстрима затирают форковые, и разбор падает на "Could not deserialize ATN with
+// version 3 (expected 4)". Апстримный рантайм в jmh не нужен — исключаем его.
+configurations.named("jmhRuntimeClasspath") {
+    exclude(group = "org.antlr", module = "antlr4-runtime")
+}
+
 sentry {
     org.set("1c-syntax")
     projectName.set("bsl-language-server")
@@ -348,20 +371,16 @@ tasks.generateDiagnosticDocs {
 }
 
 tasks.javadoc {
-    // Версия antlr4 приходит транзитивно (через bsl-parser), поэтому берём её
-    // из разрешённого runtimeClasspath, чтобы ссылка на javadoc.io указывала
-    // ровно на используемую версию (иначе .../latest даёт redirect-warning).
-    val antlr4Version = configurations.runtimeClasspath.get()
-        .resolvedConfiguration.resolvedArtifacts
-        .map { it.moduleVersion.id }
-        .first { it.group == "io.github.1c-syntax" && it.name == "antlr4" }
-        .version
+    // Вложенные CLAUDE.md лежат рядом с исходниками; delombok копирует их в сгенерированные
+    // сорсы, и javadoc спотыкается о них ("Illegal package name"). Исключаем не-java файлы.
+    exclude("**/*.md")
+
     options {
         this as StandardJavadocDocletOptions
         links(
             "https://1c-syntax.github.io/bsl-parser/dev/javadoc",
             "https://1c-syntax.github.io/mdclasses/dev/javadoc",
-            "https://javadoc.io/doc/io.github.1c-syntax/antlr4/$antlr4Version"
+            "https://1c-syntax.github.io/antlr/javadoc/"
         )
         // Проверяем корректность javadoc (битые ссылки, синтаксис, html),
         // но не требуем наличия комментариев у каждого элемента (группа missing).

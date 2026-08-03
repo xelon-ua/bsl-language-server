@@ -235,4 +235,302 @@ class TypeSetTest {
     // when / then
     assertThrows(UnsupportedOperationException.class, () -> ts.refs().add(STRING));
   }
+
+  @Test
+  void withLazyElementForcedOnRead() {
+    // given: ленивый элемент массива — разрешается на чтении.
+    var array = TypeSet.of(ARRAY)
+      .withLazyElement(ARRAY, new LazyTypeSet("k", () -> TypeSet.of(STRUCTURE)));
+
+    // then
+    assertThat(array.refs()).containsExactly(ARRAY);
+    assertThat(array.getElementTypes(ARRAY).refs()).containsExactly(STRUCTURE);
+    assertThat(array.getElementTypes().refs()).containsExactly(STRUCTURE);
+  }
+
+  @Test
+  void withLazyElementAddsRefIfMissing() {
+    // given / when
+    var ts = TypeSet.EMPTY.withLazyElement(ARRAY, new LazyTypeSet("k", () -> TypeSet.of(NUMBER)));
+
+    // then
+    assertThat(ts.refs()).containsExactly(ARRAY);
+  }
+
+  @Test
+  void getElementTypesUnionsEagerAndLazy() {
+    // given: у одного ref'а и eager-, и lazy-элемент.
+    var ts = TypeSet.of(ARRAY)
+      .withElement(ARRAY, TypeSet.of(NUMBER))
+      .withLazyElement(ARRAY, new LazyTypeSet("k", () -> TypeSet.of(STRING)));
+
+    // then
+    assertThat(ts.getElementTypes(ARRAY).refs()).containsExactlyInAnyOrder(NUMBER, STRING);
+  }
+
+  @Test
+  void withLazyFieldMaterializesWithTypeAndDescription() {
+    // given / when
+    var ts = TypeSet.of(STRUCTURE)
+      .withLazyField(STRUCTURE, "Узел", new LazyTypeSet("k", () -> TypeSet.of(STRUCTURE)), "дочерний");
+
+    // then
+    var field = ts.getLocalFields(STRUCTURE).get("Узел");
+    assertThat(field.types().refs()).containsExactly(STRUCTURE);
+    assertThat(field.description()).isEqualTo("дочерний");
+    assertThat(ts.getFieldTypes("узел").refs()).containsExactly(STRUCTURE);
+  }
+
+  @Test
+  void getAllFieldNamesIncludesLazyWithoutForcing() {
+    // given: резолвер ленивого поля бросил бы, если бы его форсили.
+    var ts = TypeSet.of(STRUCTURE)
+      .withField(STRUCTURE, "Прямое", TypeSet.of(STRING))
+      .withLazyField(STRUCTURE, "Ленивое",
+        new LazyTypeSet("k", () -> {
+          throw new AssertionError("must not force for names");
+        }), "");
+
+    // then: имена известны без форса.
+    assertThat(ts.getAllFieldNames()).containsExactlyInAnyOrder("Прямое", "Ленивое");
+  }
+
+  @Test
+  void unionMergesLazyElementsAndFields() {
+    // given
+    var a = TypeSet.of(ARRAY)
+      .withLazyElement(ARRAY, new LazyTypeSet("ea", () -> TypeSet.of(NUMBER)))
+      .withLazyField(STRUCTURE, "K", new LazyTypeSet("fa", () -> TypeSet.of(NUMBER)), "");
+    var b = TypeSet.of(ARRAY)
+      .withLazyElement(ARRAY, new LazyTypeSet("eb", () -> TypeSet.of(STRING)))
+      .withLazyField(STRUCTURE, "K", new LazyTypeSet("fb", () -> TypeSet.of(STRING)), "");
+
+    // when
+    var union = a.union(b);
+
+    // then: разные ключи — оба форсятся и объединяются.
+    assertThat(union.getElementTypes(ARRAY).refs()).containsExactlyInAnyOrder(NUMBER, STRING);
+    assertThat(union.getFieldTypes("K").refs()).containsExactlyInAnyOrder(NUMBER, STRING);
+  }
+
+  @Test
+  void addPreservesLazyDecorations() {
+    // given
+    var ts = TypeSet.of(ARRAY)
+      .withLazyElement(ARRAY, new LazyTypeSet("k", () -> TypeSet.of(NUMBER)));
+
+    // when
+    var grown = ts.add(STRING);
+
+    // then: ленивый элемент сохранён.
+    assertThat(grown.refs()).containsExactlyInAnyOrder(ARRAY, STRING);
+    assertThat(grown.getElementTypes(ARRAY).refs()).containsExactly(NUMBER);
+  }
+
+  @Test
+  void withLazyFieldAccumulatesMultipleFields() {
+    // given: два ленивых поля подряд — покрывает копирование существующих бакетов.
+    var ts = TypeSet.of(STRUCTURE)
+      .withLazyField(STRUCTURE, "A", new LazyTypeSet("a", () -> TypeSet.of(NUMBER)), "")
+      .withLazyField(STRUCTURE, "B", new LazyTypeSet("b", () -> TypeSet.of(STRING)), "");
+
+    // then
+    assertThat(ts.getAllFieldNames()).containsExactlyInAnyOrder("A", "B");
+    assertThat(ts.getFieldTypes("A").refs()).containsExactly(NUMBER);
+    assertThat(ts.getFieldTypes("B").refs()).containsExactly(STRING);
+  }
+
+  @Test
+  void unionAddsLazyDecorationsOnNewRefs() {
+    // given: other несёт ленивые декорации на ref'ах, которых нет у this.
+    var a = TypeSet.of(NUMBER);
+    var b = TypeSet.of(ARRAY)
+      .withLazyElement(ARRAY, new LazyTypeSet("e", () -> TypeSet.of(STRING)))
+      .withLazyField(STRUCTURE, "K", new LazyTypeSet("f", () -> TypeSet.of(NUMBER)), "опис");
+
+    // when
+    var union = a.union(b);
+
+    // then: новые бакеты ленивых декораций созданы.
+    assertThat(union.getElementTypes(ARRAY).refs()).containsExactly(STRING);
+    assertThat(union.getFieldTypes("K").refs()).containsExactly(NUMBER);
+    assertThat(union.getLocalFields(STRUCTURE).get("K").description()).isEqualTo("опис");
+  }
+
+  @Test
+  void getFieldTypesIgnoresNonMatchingLazyField() {
+    // given: ленивое поле с другим именем — не должно попасть в выборку.
+    var ts = TypeSet.of(STRUCTURE)
+      .withLazyField(STRUCTURE, "Другое", new LazyTypeSet("k", () -> TypeSet.of(NUMBER)), "");
+
+    // when / then
+    assertThat(ts.getFieldTypes("Искомое")).isSameAs(TypeSet.EMPTY);
+  }
+
+  @Test
+  void unionWithLazyOnlyOtherIsNotShortCircuited() {
+    // given: other непустой только по ленивым декорациям — не должен «потеряться».
+    var self = TypeSet.of(NUMBER);
+    var lazyOnly = TypeSet.of(ARRAY)
+      .withLazyElement(ARRAY, new LazyTypeSet("k", () -> TypeSet.of(STRING)));
+
+    // when
+    var union = self.union(lazyOnly);
+
+    // then
+    assertThat(union.refs()).containsExactlyInAnyOrder(NUMBER, ARRAY);
+    assertThat(union.getElementTypes(ARRAY).refs()).containsExactly(STRING);
+  }
+
+  @Test
+  void retainingKeepsOnlyRequestedRef() {
+    // given
+    var ts = TypeSet.of(NUMBER, STRING, ARRAY);
+
+    // when
+    var narrowed = ts.retaining(STRING);
+
+    // then
+    assertThat(narrowed.refs()).containsExactly(STRING);
+  }
+
+  @Test
+  void retainingKeepsDecorationsOfKeptRef() {
+    // given: у оставляемого типа есть и элементы, и поля.
+    var ts = TypeSet.of(ARRAY, STRUCTURE)
+      .withElement(ARRAY, TypeSet.of(NUMBER))
+      .withField(STRUCTURE, "Ключ", TypeSet.of(STRING));
+
+    // when
+    var narrowed = ts.retaining(ARRAY);
+
+    // then
+    assertThat(narrowed.refs()).containsExactly(ARRAY);
+    assertThat(narrowed.getElementTypes(ARRAY).refs()).containsExactly(NUMBER);
+    assertThat(narrowed.localFields()).doesNotContainKey(STRUCTURE);
+  }
+
+  @Test
+  void retainingKeepsLazyDecorationsOfKeptRef() {
+    // given: декорации оставляемого типа заданы ленивыми ссылками.
+    var ts = TypeSet.of(ARRAY, STRUCTURE)
+      .withLazyElement(ARRAY, new LazyTypeSet("k", () -> TypeSet.of(NUMBER)))
+      .withLazyField(STRUCTURE, "Ключ", new LazyTypeSet("k2", () -> TypeSet.of(STRING)), "");
+
+    // when
+    var narrowed = ts.retaining(ARRAY);
+
+    // then
+    assertThat(narrowed.getElementTypes(ARRAY).refs()).containsExactly(NUMBER);
+    assertThat(narrowed.lazyFields()).doesNotContainKey(STRUCTURE);
+  }
+
+  @Test
+  void retainingUnknownRefGivesEmpty() {
+    // given
+    var ts = TypeSet.of(NUMBER, STRING);
+
+    // when / then
+    assertThat(ts.retaining(ARRAY)).isSameAs(TypeSet.EMPTY);
+  }
+
+  @Test
+  void withoutDropsRefAndItsDecorations() {
+    // given
+    var ts = TypeSet.of(ARRAY, STRUCTURE)
+      .withElement(ARRAY, TypeSet.of(NUMBER))
+      .withField(STRUCTURE, "Ключ", TypeSet.of(STRING));
+
+    // when
+    var narrowed = ts.without(STRUCTURE);
+
+    // then
+    assertThat(narrowed.refs()).containsExactly(ARRAY);
+    assertThat(narrowed.getElementTypes(ARRAY).refs()).containsExactly(NUMBER);
+    assertThat(narrowed.localFields()).doesNotContainKey(STRUCTURE);
+  }
+
+  @Test
+  void withoutUnknownRefReturnsSelf() {
+    // given
+    var ts = TypeSet.of(NUMBER, STRING);
+
+    // when / then
+    assertThat(ts.without(ARRAY)).isSameAs(ts);
+  }
+
+  @Test
+  void withoutLastRefGivesEmpty() {
+    // given: единственный тип с декорацией — уходит вместе с ней.
+    var ts = TypeSet.of(ARRAY).withElement(ARRAY, TypeSet.of(NUMBER));
+
+    // when / then
+    assertThat(ts.without(ARRAY)).isSameAs(TypeSet.EMPTY);
+  }
+
+  @Test
+  void mapRefsMovesDecorationsToMappedRef() {
+    // given
+    var ts = TypeSet.of(ARRAY)
+      .withElement(ARRAY, TypeSet.of(NUMBER))
+      .withField(ARRAY, "Поле", TypeSet.of(STRING));
+    var renamed = new TypeRef(TypeKind.CONFIGURATION, "Массив");
+
+    // when
+    var mapped = ts.mapRefs(ref -> ARRAY.equals(ref) ? renamed : ref);
+
+    // then
+    assertThat(mapped.refs()).containsExactly(renamed);
+    assertThat(mapped.getElementTypes(renamed).refs()).containsExactly(NUMBER);
+    assertThat(mapped.getLocalFields(renamed)).containsOnlyKeys("Поле");
+  }
+
+  @Test
+  void mapRefsGoesIntoDecorationsWhenOuterRefUnchanged() {
+    // given: снаружи менять нечего, а внутри декораций ссылка неканоническая.
+    var innerAlias = new TypeRef(TypeKind.PLATFORM, "Структура");
+    var ts = TypeSet.of(ARRAY)
+      .withElement(ARRAY, TypeSet.of(innerAlias))
+      .withField(ARRAY, "Поле", TypeSet.of(innerAlias));
+    var canonical = new TypeRef(TypeKind.CONFIGURATION, "Структура");
+
+    // when
+    var mapped = ts.mapRefs(ref -> innerAlias.equals(ref) ? canonical : ref);
+
+    // then
+    assertThat(mapped.refs()).containsExactly(ARRAY);
+    assertThat(mapped.getElementTypes(ARRAY).refs()).containsExactly(canonical);
+    assertThat(mapped.getLocalFields(ARRAY).get("Поле").types().refs()).containsExactly(canonical);
+  }
+
+  @Test
+  void mapRefsAppliesToLazyDecorationOnRead() {
+    // given: тип элемента отложен — источник вернёт неканоническую ссылку.
+    var alias = new TypeRef(TypeKind.PLATFORM, "Структура");
+    var canonical = new TypeRef(TypeKind.CONFIGURATION, "Структура");
+    var forced = new boolean[1];
+    var lazy = new LazyTypeSet("источник", () -> {
+      forced[0] = true;
+      return TypeSet.of(alias);
+    });
+    var ts = TypeSet.of(ARRAY).withLazyElement(ARRAY, lazy);
+
+    // when
+    var mapped = ts.mapRefs(ref -> alias.equals(ref) ? canonical : ref);
+
+    // then: приведение не форсит источник...
+    assertThat(forced[0]).as("ленивая декорация не вычисляется при приведении").isFalse();
+    // ...но применяется к тому, что он вернёт при чтении.
+    assertThat(mapped.getElementTypes(ARRAY).refs()).containsExactly(canonical);
+    assertThat(forced[0]).isTrue();
+  }
+
+  @Test
+  void mapRefsWithoutChangesReturnsSelf() {
+    // given
+    var ts = TypeSet.of(ARRAY).withElement(ARRAY, TypeSet.of(NUMBER));
+
+    // when / then
+    assertThat(ts.mapRefs(ref -> ref)).isSameAs(ts);
+  }
 }

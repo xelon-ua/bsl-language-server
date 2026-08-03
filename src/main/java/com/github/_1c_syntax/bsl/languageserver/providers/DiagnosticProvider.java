@@ -21,15 +21,15 @@
  */
 package com.github._1c_syntax.bsl.languageserver.providers;
 
-import com.github._1c_syntax.bsl.languageserver.ClientCapabilitiesHolder;
-import com.github._1c_syntax.bsl.languageserver.LanguageClientHolder;
+import com.github._1c_syntax.bsl.languageserver.client.ClientCapabilitiesHolder;
+import com.github._1c_syntax.bsl.languageserver.client.LanguageClientHolder;
 import com.github._1c_syntax.bsl.languageserver.configuration.events.LanguageServerConfigurationChangedEvent;
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
 import com.github._1c_syntax.bsl.languageserver.context.ServerContext;
 import com.github._1c_syntax.bsl.languageserver.context.ServerContextProvider;
 import com.github._1c_syntax.bsl.languageserver.context.events.ConfigurationTypesRegisteredEvent;
 import com.github._1c_syntax.bsl.languageserver.context.events.ServerContextPopulatedEvent;
-import com.github._1c_syntax.bsl.languageserver.events.LanguageServerInitializeRequestReceivedEvent;
+import com.github._1c_syntax.bsl.languageserver.events.LanguageServerInitializedEvent;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.eclipse.lsp4j.ClientCapabilities;
@@ -122,14 +122,14 @@ public final class DiagnosticProvider {
   }
 
   /**
-   * Обработчик события {@link LanguageServerInitializeRequestReceivedEvent}.
+   * Обработчик события {@link LanguageServerInitializedEvent}.
    * <p>
    * Проверяет поддержку клиентом workspace/diagnostic/refresh.
    *
    * @param event Событие
    */
   @EventListener
-  public void handleInitializeEvent(LanguageServerInitializeRequestReceivedEvent event) {
+  public void handleInitializeEvent(LanguageServerInitializedEvent event) {
     clientSupportsRefresh = clientCapabilitiesHolder.getCapabilities()
       .map(ClientCapabilities::getWorkspace)
       .map(WorkspaceClientCapabilities::getDiagnostics)
@@ -208,7 +208,22 @@ public final class DiagnosticProvider {
       return;
     }
     LOGGER.debug("Pushing recomputed diagnostics to {} opened document(s)", opened.size());
-    opened.forEach(this::computeAndPublishDiagnostics);
+    opened.forEach(this::computeAndPublishDiagnosticsUnderLock);
+  }
+
+  /**
+   * Вычислить и опубликовать диагностики под read-локом документа: пересчёт не должен
+   * пересекаться с конкурентным перестроением документа и синхронной переиндексацией
+   * ссылок (писатели — didOpen, {@code DocumentChangeExecutor} — держат write-лок).
+   */
+  private void computeAndPublishDiagnosticsUnderLock(DocumentContext documentContext) {
+    var lock = documentContext.getServerContext().getDocumentLock(documentContext.getUri());
+    lock.readLock().lock();
+    try {
+      computeAndPublishDiagnostics(documentContext);
+    } finally {
+      lock.readLock().unlock();
+    }
   }
 
   private void publishDiagnostics(DocumentContext documentContext, Supplier<List<Diagnostic>> diagnostics) {

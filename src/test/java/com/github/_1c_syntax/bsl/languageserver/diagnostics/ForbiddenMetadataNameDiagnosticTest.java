@@ -82,7 +82,7 @@ class ForbiddenMetadataNameDiagnosticTest extends AbstractDiagnosticTest<Forbidd
 
     List<Diagnostic> diagnostics = diagnosticInstance.getDiagnostics(documentContext);
 
-    assertThat(diagnostics).hasSize(19);
+    assertThat(diagnostics).hasSize(18);
     assertThat(diagnostics, true)
       .hasMessageOnRange("Запрещено использовать имя `Справочник` для `Справочник.Справочник1`", 0, 0, 9)
       .hasMessageOnRange(
@@ -122,7 +122,7 @@ class ForbiddenMetadataNameDiagnosticTest extends AbstractDiagnosticTest<Forbidd
 
     // должен отфильтроваться справочник, т.к. модули у него есть
     assertThat(diagnostics)
-      .hasSize(2)
+      .hasSize(3)
       .noneMatch(diagnostic -> DiagnosticMessage.getStringValue(diagnostic.getMessage()).contains("для `Справочник.Справочник1"));
   }
 
@@ -157,7 +157,7 @@ class ForbiddenMetadataNameDiagnosticTest extends AbstractDiagnosticTest<Forbidd
 
     // должен отфильтроваться справочник, т.к. модули у него есть
     assertThat(diagnostics)
-      .hasSize(5)
+      .hasSize(6)
       .allMatch(diagnostic -> DiagnosticMessage.getStringValue(diagnostic.getMessage()).contains("Запрещено использовать имя `РегистрСведений` для"))
       .anyMatch(diagnostic -> DiagnosticMessage.getStringValue(diagnostic.getMessage()).contains("для `Справочник.РегистрСведений"))
       .anyMatch(diagnostic -> DiagnosticMessage.getStringValue(diagnostic.getMessage()).contains("для `Документ.РегистрСведений"))

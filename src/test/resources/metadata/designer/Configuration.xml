@@ -202,8 +202,10 @@
 			<EventSubscription>РегистрацияИзмененийПередУдалением</EventSubscription>
 			<CommandGroup>ГруппаКоманд1</CommandGroup>
 			<CommonAttribute>ОбщийРеквизит1</CommonAttribute>
+			<DefinedType>ОпределяемыйТип1</DefinedType>
 			<Catalog>Справочник1</Catalog>
 			<Catalog>СправочникСМенеджером</Catalog>
+			<Catalog>СправочникБезГрупп</Catalog>
 			<InformationRegister>РегистрСведений1</InformationRegister>
 			<FilterCriterion>КритерийОтбора1</FilterCriterion>
 			<Document>Документ1</Document>
@@ -213,6 +215,7 @@
 			<ScheduledJob>РегламентноеЗаданиеПриватныйМетод</ScheduledJob>
 			<ScheduledJob>РегламентноеЗаданиеПредопределенноеНесколькоПараметров</ScheduledJob>
 			<ExternalDataSource>ВнешнийИсточникДанных1</ExternalDataSource>
+			<XDTOPackage>ПакетТест</XDTOPackage>
 		</ChildObjects>
 	</Configuration>
 </MetaDataObject>

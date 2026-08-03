@@ -25,10 +25,13 @@ import com.github._1c_syntax.bsl.languageserver.configuration.Language;
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
 import com.github._1c_syntax.bsl.languageserver.context.events.DocumentContextContentChangedEvent;
 import com.github._1c_syntax.bsl.languageserver.context.events.ServerContextDocumentClearedEvent;
+import com.github._1c_syntax.bsl.languageserver.context.events.ServerContextPopulatedEvent;
+import com.github._1c_syntax.bsl.languageserver.context.symbol.MethodSymbol;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.SourceDefinedSymbol;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.Symbol;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.VariableSymbol;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.variable.VariableKind;
+import com.github._1c_syntax.bsl.languageserver.index.AbstractDocumentLifecycleClearableIndex;
 import com.github._1c_syntax.bsl.languageserver.utils.FuzzyMatcher;
 import com.github._1c_syntax.bsl.mdo.MD;
 import com.github._1c_syntax.bsl.types.ScriptVariant;
@@ -45,6 +48,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.EnumSet;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -247,6 +251,32 @@ public class WorkspaceSymbolIndex extends AbstractDocumentLifecycleClearableInde
   }
 
   /**
+   * Ужать backing-массивы бакетов до фактического размера после массового наполнения
+   * ({@code populateContext}).
+   * <p>
+   * Бакеты создаются как {@link ArrayList} с ёмкостью по умолчанию (10) и растут инкрементально по
+   * мере индексации документов. Подавляющее большинство ключей дерева редкие (1–3 записи), поэтому у
+   * них остаётся запас ёмкости; в сумме по множеству ключей это заметный перерасход. Триминг после
+   * наполнения возвращает массивы к точному размеру (аналог {@code trimToSize} в
+   * {@code SymbolTreeComputer}). Последующие инкрементальные правки до-растят бакеты как обычно.
+   *
+   * @param event событие завершения наполнения контекста
+   */
+  @EventListener
+  public void handleServerContextPopulated(ServerContextPopulatedEvent event) {
+    lock.writeLock().lock();
+    try {
+      for (var bucket : trie.values()) {
+        if (bucket instanceof ArrayList<?> arrayList) {
+          arrayList.trimToSize();
+        }
+      }
+    } finally {
+      lock.writeLock().unlock();
+    }
+  }
+
+  /**
    * Удалить записи индекса, относящиеся к данному URI документа.
    * <p>
    * Каждая запись лежит под несколькими ключами (полное имя и начало каждого CamelCase-слова),
@@ -266,12 +296,12 @@ public class WorkspaceSymbolIndex extends AbstractDocumentLifecycleClearableInde
       if (removed == null || removed.isEmpty()) {
         return;
       }
-      var removedSet = Collections.<Entry>newSetFromMap(new IdentityHashMap<>());
-      removedSet.addAll(removed);
+      var keys = new HashSet<String>();
       for (var entry : removed) {
-        for (var key : keysOf(entry.name())) {
-          removeEntryFromKey(key, removedSet);
-        }
+        keys.addAll(keysOf(entry.name()));
+      }
+      for (var key : keys) {
+        removeEntryFromKey(key, uri);
       }
     } finally {
       lock.writeLock().unlock();
@@ -660,7 +690,6 @@ public class WorkspaceSymbolIndex extends AbstractDocumentLifecycleClearableInde
 
   private void index(DocumentContext documentContext) {
     var uri = documentContext.getUri();
-    clear(uri);
 
     var scriptVariant = scriptVariantOf(documentContext);
     var collected = new ArrayList<Entry>();
@@ -672,11 +701,20 @@ public class WorkspaceSymbolIndex extends AbstractDocumentLifecycleClearableInde
       collected.add(toEntry(uri, symbol, scriptVariant));
     }
 
-    if (collected.isEmpty()) {
+    var snapshot = List.copyOf(collected);
+    // Переиндексация — no-op, если набор записей не изменился. При batch-анализе один и тот же
+    // документ перестраивается дважды (populateContext, затем rebuild на этапе диагностик), но
+    // индексируемые данные (имя, kind, range, теги, containerName) не меняются. Entry — record со
+    // значимым equals, порядок детерминирован (обход дерева символов), так что снимки равны и
+    // пересборка trie (взятие глобального write-lock'а) пропускается полностью.
+    if (snapshot.equals(indexedByUri.get(uri))) {
       return;
     }
 
-    var snapshot = List.copyOf(collected);
+    clear(uri);
+    if (snapshot.isEmpty()) {
+      return;
+    }
 
     lock.writeLock().lock();
     try {
@@ -686,7 +724,12 @@ public class WorkspaceSymbolIndex extends AbstractDocumentLifecycleClearableInde
       indexedByUri.put(uri, snapshot);
       for (var entry : snapshot) {
         for (var key : keysOf(entry.name())) {
-          trie.merge(key, List.of(entry), WorkspaceSymbolIndex::concat);
+          var bucket = trie.get(key);
+          if (bucket == null) {
+            bucket = new ArrayList<>();
+            trie.put(key, bucket);
+          }
+          bucket.add(entry);
         }
       }
     } finally {
@@ -724,22 +767,21 @@ public class WorkspaceSymbolIndex extends AbstractDocumentLifecycleClearableInde
   }
 
   /**
-   * Удалить из {@link #trie} записи с данным ключом, попавшие в {@code toRemove};
-   * пустой после фильтрации ключ удаляется целиком. Вызывается под write-lock.
+   * Удалить из бакета данного ключа все записи документа {@code uri}; опустевший ключ удаляется
+   * из {@link #trie} целиком. Бакет мутабельный — удаление идёт на месте, без пересборки списка.
+   * Вызывается под write-lock.
    *
-   * @param key      lowercase-имя (ключ дерева)
-   * @param toRemove удаляемые записи (по идентичности)
+   * @param key lowercase-имя (ключ дерева)
+   * @param uri URI документа, чьи записи удаляются
    */
-  private void removeEntryFromKey(String key, Set<Entry> toRemove) {
+  private void removeEntryFromKey(String key, URI uri) {
     var bucket = trie.get(key);
     if (bucket == null) {
       return;
     }
-    var filtered = withoutEntries(bucket, toRemove);
-    if (filtered.isEmpty()) {
+    bucket.removeIf(entry -> entry.uri().equals(uri));
+    if (bucket.isEmpty()) {
       trie.remove(key);
-    } else {
-      trie.put(key, filtered);
     }
   }
 
@@ -757,12 +799,20 @@ public class WorkspaceSymbolIndex extends AbstractDocumentLifecycleClearableInde
     );
   }
 
+  /**
+   * Поддерживается ли символ в {@code workspace/symbol}: любой {@link MethodSymbol}
+   * (обычный метод, конструктор OneScript-класса, обработчик платформенного события {@link
+   * com.github._1c_syntax.bsl.languageserver.context.symbol.EventMethodSymbol} — и в будущем любой
+   * новый подтип) и переменные модульного/глобального уровня.
+   */
   private static boolean isSupported(Symbol symbol) {
-    return switch (symbol.getSymbolKind()) {
-      case Method, Constructor -> true;
-      case Variable -> SUPPORTED_VARIABLE_KINDS.contains(((VariableSymbol) symbol).getKind());
-      default -> false;
-    };
+    if (symbol instanceof MethodSymbol) {
+      return true;
+    }
+    if (symbol instanceof VariableSymbol variableSymbol) {
+      return SUPPORTED_VARIABLE_KINDS.contains(variableSymbol.getKind());
+    }
+    return false;
   }
 
   private static Optional<String> getContainerName(SourceDefinedSymbol symbol, ScriptVariant scriptVariant) {
@@ -777,22 +827,6 @@ public class WorkspaceSymbolIndex extends AbstractDocumentLifecycleClearableInde
       : ScriptVariant.RUSSIAN;
   }
 
-  private static List<Entry> concat(List<Entry> existing, List<Entry> added) {
-    var copy = new ArrayList<Entry>(existing.size() + added.size());
-    copy.addAll(existing);
-    copy.addAll(added);
-    return List.copyOf(copy);
-  }
-
-  private static List<Entry> withoutEntries(List<Entry> source, Set<Entry> toRemove) {
-    var copy = new ArrayList<Entry>(source.size());
-    for (var entry : source) {
-      if (!toRemove.contains(entry)) {
-        copy.add(entry);
-      }
-    }
-    return List.copyOf(copy);
-  }
 
   /**
    * Счётчик просмотренных записей для периодической проверки отмены запроса.

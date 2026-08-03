@@ -21,12 +21,13 @@
  */
 package com.github._1c_syntax.bsl.languageserver.providers;
 
-import com.github._1c_syntax.bsl.languageserver.ClientCapabilitiesHolder;
+import com.github._1c_syntax.bsl.languageserver.client.ClientCapabilitiesHolder;
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.SourceDefinedSymbol;
-import com.github._1c_syntax.bsl.languageserver.events.LanguageServerInitializeRequestReceivedEvent;
+import com.github._1c_syntax.bsl.languageserver.events.LanguageServerInitializedEvent;
 import com.github._1c_syntax.bsl.languageserver.references.ReferenceResolver;
 import com.github._1c_syntax.bsl.languageserver.references.model.Reference;
+import com.github._1c_syntax.bsl.languageserver.types.symbol.PlatformMemberSymbol;
 import lombok.RequiredArgsConstructor;
 import org.eclipse.lsp4j.ClientCapabilities;
 import org.eclipse.lsp4j.DefinitionCapabilities;
@@ -61,13 +62,13 @@ public class DefinitionProvider {
   private boolean linkSupport;
 
   /**
-   * Обработчик события {@link LanguageServerInitializeRequestReceivedEvent}.
+   * Обработчик события {@link LanguageServerInitializedEvent}.
    * <p>
    * Кэширует клиентскую возможность {@code textDocument.definition.linkSupport},
    * влияющую на формат ответа навигации: при её отсутствии ответ {@link LocationLink}
    * понижается до {@link Location}.
    */
-  @EventListener(LanguageServerInitializeRequestReceivedEvent.class)
+  @EventListener(LanguageServerInitializedEvent.class)
   public void handleInitializeEvent() {
     linkSupport = clientCapabilitiesHolder.getCapabilities()
       .map(ClientCapabilities::getTextDocument)
@@ -110,10 +111,45 @@ public class DefinitionProvider {
     Position position = params.getPosition();
 
     return referenceResolver.findReference(documentContext.getUri(), position)
+      .map(DefinitionProvider::unwrapPlatformMemberSource)
       .filter(Reference::isSourceDefinedSymbolReference)
       .map(DefinitionProvider::toLocationLink)
       .map(Collections::singletonList)
       .orElse(Collections.emptyList());
+  }
+
+  /**
+   * Если ссылка указывает на член платформенного/конфигурационного типа
+   * (синтетический {@link PlatformMemberSymbol}, разрешённый через
+   * {@code TypeService.memberAt}) и у его дескриптора есть source-defined
+   * символ-источник (метод OneScript-класса, экспортная переменная-свойство
+   * и т.п. — см. {@code OScriptModuleMembersProvider}), возвращает ссылку,
+   * перенаправленную на этот источник; иначе возвращает ссылку без изменений.
+   * <p>
+   * Так основной пайплайн перехода не меняется: платформенные члены без
+   * источника остаются {@link PlatformMemberSymbol} и отсекаются фильтром
+   * {@link Reference#isSourceDefinedSymbolReference()} (остаётся только hover).
+   * <p>
+   * Обсуждение и дизайн: https://github.com/1c-syntax/bsl-language-server/pull/4197
+   *
+   * @param reference исходная ссылка под курсором.
+   * @return ссылка на source-defined источник либо исходная ссылка.
+   */
+  private static Reference unwrapPlatformMemberSource(Reference reference) {
+    if (!(reference.symbol() instanceof PlatformMemberSymbol platformMember)) {
+      return reference;
+    }
+    return platformMember.getDescriptor().getSourceSymbol()
+      .filter(SourceDefinedSymbol.class::isInstance)
+      .map(SourceDefinedSymbol.class::cast)
+      .map(sourceSymbol -> new Reference(
+        reference.from(),
+        sourceSymbol,
+        reference.uri(),
+        reference.selectionRange(),
+        reference.occurrenceType()
+      ))
+      .orElse(reference);
   }
 
   private static LocationLink toLocationLink(Reference reference) {

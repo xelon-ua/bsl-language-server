@@ -28,7 +28,7 @@ import com.contrastsecurity.sarif.SarifSchema210;
 import com.github._1c_syntax.bsl.languageserver.configuration.LanguageServerConfiguration;
 import com.github._1c_syntax.bsl.languageserver.context.AbstractServerContextAwareTest;
 import com.github._1c_syntax.bsl.languageserver.diagnostics.infrastructure.DiagnosticInfos;
-import com.github._1c_syntax.bsl.languageserver.diagnostics.metadata.DiagnosticInfo;
+import com.github._1c_syntax.bsl.languageserver.diagnostics.info.DiagnosticInfo;
 import com.github._1c_syntax.bsl.languageserver.reporters.data.AnalysisInfo;
 import com.github._1c_syntax.bsl.languageserver.reporters.data.FileInfo;
 import com.github._1c_syntax.bsl.languageserver.util.CleanupContextBeforeClassAndAfterEachTestMethod;
@@ -76,7 +76,11 @@ class SarifReporterTest extends AbstractServerContextAwareTest {
 
   @BeforeEach
   void setUp() {
-    initServerContext(SOURCE_DIR, false);
+    // Workspace нужен только для резолва workspace-scoped бинов: отчёт строится из
+    // AnalysisInfo, а не из содержимого контекста. Пустой каталог вместо корня проекта —
+    // регистрация корня индексировала бы OneScript-библиотеки всего репозитория
+    // (чтение и разбор каждого .os) на каждый тест-метод.
+    initServerContext();
     diagnosticInfos = diagnosticInfosBean.getByCode().values();
     FileUtils.deleteQuietly(file);
   }
@@ -153,6 +157,11 @@ class SarifReporterTest extends AbstractServerContextAwareTest {
       .matches(region -> region.getEndColumn().equals(diagnostic.getRange().getEnd().getCharacter() + 1))
     ;
 
+  }
+
+  @Test
+  void doesNotRequireMetricCalculation() {
+    assertThat(reporter.isMetricCalculationRequired()).isFalse();
   }
 
 }

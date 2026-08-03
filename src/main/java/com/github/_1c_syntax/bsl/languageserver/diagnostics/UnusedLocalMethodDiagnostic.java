@@ -32,9 +32,9 @@ import com.github._1c_syntax.bsl.languageserver.diagnostics.metadata.DiagnosticT
 import com.github._1c_syntax.bsl.languageserver.references.ReferenceIndex;
 import com.github._1c_syntax.bsl.languageserver.types.index.EventContractsIndex;
 import com.github._1c_syntax.bsl.languageserver.types.registry.BslContextHolder;
-import com.github._1c_syntax.bsl.languageserver.utils.DiagnosticHelper;
+import com.github._1c_syntax.bsl.mdo.Form;
+import com.github._1c_syntax.bsl.mdo.support.FormType;
 import com.github._1c_syntax.bsl.types.ModuleType;
-import com.github._1c_syntax.utils.CaseInsensitivePattern;
 
 import java.util.EnumSet;
 import java.util.Map;
@@ -52,10 +52,6 @@ import java.util.regex.Pattern;
   }
 )
 public class UnusedLocalMethodDiagnostic extends AbstractDiagnostic {
-
-  private static final Pattern HANDLER_PATTERN = CaseInsensitivePattern.compile(
-    "(ПриСозданииОбъекта|OnObjectCreate)"
-  );
 
   /**
    * Префиксы подключаемых методов
@@ -107,9 +103,21 @@ public class UnusedLocalMethodDiagnostic extends AbstractDiagnostic {
   @Override
   public void check() {
     var moduleType = documentContext.getModuleType();
-    // Формы пока вне зоны действия: обработчики декларируются в Form.xml
-    // блоком <Events>, без отдельной поддержки их не отличить от «забытых» методов.
+    // Тип модуля неизвестен — так выглядит одиночный файл, открытый вне проекта.
+    // Владельца модуля, а значит и его событий, не видно: каждый обработчик выглядит
+    // методом, которого никто не зовёт.
+    if (moduleType == ModuleType.UNKNOWN) {
+      return;
+    }
     if (moduleType == ModuleType.FormModule) {
+      // Обработчики управляемой формы объявлены в Form.xml и висят на её типе
+      // EVENT-членами независимо от того, нашёлся ли контракт события в
+      // синтакс-помощнике, — поэтому HBK здесь не нужен. У обычной формы своя иерархия
+      // элементов со своими событиями, в системе типов не смоделированная: там
+      // забытым методом выглядел бы любой обработчик.
+      if (isManagedForm()) {
+        reportUnused();
+      }
       return;
     }
     // CommonModule (нет событий) и OScriptClass (события захардкожены в резолвере)
@@ -119,7 +127,7 @@ public class UnusedLocalMethodDiagnostic extends AbstractDiagnostic {
       return;
     }
     // С HBK обработчики корректно отсекаются через EventContractsIndex — работаем
-    // во всех остальных модулях кроме форм.
+    // во всех остальных модулях.
     if (hbkLoaded) {
       reportUnused();
       return;
@@ -130,13 +138,26 @@ public class UnusedLocalMethodDiagnostic extends AbstractDiagnostic {
     }
   }
 
+  /**
+   * Управляемая ли форма стоит за модулем. У обычной формы своя иерархия элементов и
+   * свои события, в системе типов не смоделированные, — там любой обработчик выглядел
+   * бы забытым методом.
+   *
+   * @return {@code true}, если модуль принадлежит управляемой форме.
+   */
+  private boolean isManagedForm() {
+    return documentContext.getMdObject()
+      .filter(Form.class::isInstance)
+      .map(mdObject -> ((Form) mdObject).getFormType() == FormType.MANAGED)
+      .orElse(false);
+  }
+
   private void reportUnused() {
     documentContext.getSymbolTree().getMethods()
       .stream()
       .filter(method -> !method.isExport())
       .filter(method -> !isOverride(method))
       .filter(method -> !isAttachable(method))
-      .filter(method -> !isHandler(method))
       // Платформенный обработчик события (резолвится EventHandlerResolver'ом
       // по имени метода в object/manager/recordset/global/OScript-модулях).
       // Он вызывается платформой по триггеру события, в теле модуля никаких
@@ -148,10 +169,6 @@ public class UnusedLocalMethodDiagnostic extends AbstractDiagnostic {
 
   private boolean isAttachable(MethodSymbol methodSymbol) {
     return attachableMethodPrefixes.matcher(methodSymbol.getName()).matches();
-  }
-
-  private static boolean isHandler(MethodSymbol methodSymbol) {
-    return HANDLER_PATTERN.matcher(methodSymbol.getName()).matches();
   }
 
   private static boolean isOverride(MethodSymbol method) {

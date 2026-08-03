@@ -45,6 +45,7 @@ import org.springframework.stereotype.Component;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -97,7 +98,7 @@ import org.jspecify.annotations.Nullable;
 @RequiredArgsConstructor
 public class MetadataCollectionSpecializer {
 
-  private static final String BASE_COLLECTION_METADATA = "КоллекцияОбъектовМетаданных";
+  private static final String BASE_COLLECTION_METADATA = MetadataTypeNames.METADATA_COLLECTION;
   private static final String BASE_COLLECTION_STD_ATTR = "ОписанияСтандартныхРеквизитов";
   private static final String BASE_COLLECTION_PROPERTY_VALUE = "КоллекцияЗначенийСвойстваОбъектаМетаданных";
   private static final String BASE_COLLECTION_FIELD_LIST = "СписокПолей";
@@ -286,22 +287,25 @@ public class MetadataCollectionSpecializer {
       MetadataChildrenExtractor::registerRecordsFor),
 
     // ВводитсяНаОсновании — типы, на основании которых вводится объект.
-    // В mdclasses нет удобного getter'а — оставляем только returnType chain.
     new CollectionSpec("ВводитсяНаОсновании", "BasedOn",
       BASE_COLLECTION_PROPERTY_VALUE, "ЗначениеСвойстваОбъектаМетаданных",
-      ANY, md -> List.of()),
+      ANY, MetadataChildrenExtractor::basedOnFor),
 
     // Поля ввода по строке / блокировки данных — СписокПолей с элементами «Поле».
     new CollectionSpec("ВводПоСтроке", "InputByString",
-      BASE_COLLECTION_FIELD_LIST, "Поле", ANY, md -> List.of()),
+      BASE_COLLECTION_FIELD_LIST, "Поле", ANY, MetadataChildrenExtractor::inputByStringFor),
     new CollectionSpec("ПоляБлокировкиДанных", "DataLockFields",
-      BASE_COLLECTION_FIELD_LIST, "Поле", ANY, md -> List.of()),
+      BASE_COLLECTION_FIELD_LIST, "Поле", ANY, MetadataChildrenExtractor::dataLockFieldsFor),
 
     // Дополнительные индексы — элементы «ДополнительныйИндекс».
     new CollectionSpec(BASE_COLLECTION_ADDITIONAL_INDEXES, "AdditionalIndexes",
-      BASE_COLLECTION_ADDITIONAL_INDEXES, "ДополнительныйИндекс", ANY, md -> List.of()),
+      BASE_COLLECTION_ADDITIONAL_INDEXES, "ДополнительныйИндекс",
+      ANY, MetadataChildrenExtractor::additionalIndexesFor),
 
     // Характеристики плана видов характеристик — элементы «ОписаниеХарактеристик».
+    // Имена не разворачиваются, и дело не в данных: у `Characteristic` в mdclasses
+    // имени нет вовсе — описание характеристик это набор ссылок на таблицы и поля.
+    // Обращаться к ним по имени негде, поэтому остаётся только returnType-цепочка.
     new CollectionSpec("Характеристики", "Characteristics",
       BASE_COLLECTION_CHARACTERISTICS, "ОписаниеХарактеристик", ANY, md -> List.of())
   );
@@ -311,6 +315,15 @@ public class MetadataCollectionSpecializer {
   private final TypeRegistry typeRegistry;
   private final BslContextHolder bslContextHolder;
   private final ServerContextProvider serverContextProvider;
+
+  /**
+   * Уже обработанные per-owner synthetic-типы в рамках одного {@link #specialize()}.
+   * Обход дерева метаданных приходит к одному и тому же synthetic-типу многократно
+   * (общие имена табличных частей, общий element-type), а
+   * {@link TypeRegistry#registerMemberSource} добавляет источник без дедупликации.
+   * Защита гарантирует ровно одну регистрацию источников на тип.
+   */
+  private final Set<TypeRef> registeredOwners = new HashSet<>();
 
   private static Map<String, CollectionSpec> buildCollectionIndex() {
     var m = new HashMap<String, CollectionSpec>();
@@ -345,6 +358,7 @@ public class MetadataCollectionSpecializer {
       return;
     }
 
+    registeredOwners.clear();
     var mdosByGroup = collectMdosByGroup(configuration.getChildrenByMdoRef().values());
     var counters = new SpecializationCounters();
     for (var context : providerOpt.get().getContexts()) {
@@ -530,6 +544,9 @@ public class MetadataCollectionSpecializer {
   private TypeRef registerPerOwner(TypeRef elementTypeRef, String ownerSuffix, MD owner) {
     var perOwnerName = elementTypeRef.qualifiedName() + "." + ownerSuffix;
     var perOwnerRef = typeRegistry.intern(TypeKind.PLATFORM, perOwnerName);
+    if (!registeredOwners.add(perOwnerRef)) {
+      return perOwnerRef;
+    }
     var overrides = buildPerOwnerOverrides(perOwnerName, owner);
     var capturedElement = elementTypeRef;
     typeRegistry.registerMemberSource(perOwnerRef,
@@ -593,6 +610,12 @@ public class MetadataCollectionSpecializer {
     var perCollName = spec.baseCollectionName() + "." + spec.ru() + "." + ownerSuffix;
     var perCollRef = typeRegistry.intern(TypeKind.PLATFORM, perCollName);
     registerSubChildOwners(children, elementRef, ownerSuffix);
+    // Коллекция остаётся коллекцией: обход `Для Каждого` и индексатор дают её элемент.
+    // Для коллекций, где элементы вообще не адресуются по имени (характеристики,
+    // дополнительные индексы, ввод на основании), это единственный способ до них
+    // добраться — синтакс-помощник у них так и пишет: обход и обращение по индексу.
+    typeRegistry.registerDefaultElementTypes(perCollRef, List.of(elementRef));
+    typeRegistry.inheritCollectionTraits(perCollRef, baseRef, FileType.BSL);
     var capturedBase = baseRef;
     var capturedElement = elementRef;
     var capturedChildren = children;
@@ -736,7 +759,7 @@ public class MetadataCollectionSpecializer {
       var newSignatures = new ArrayList<SignatureDescriptor>(rebuiltSignatures.size());
       for (var sig : rebuiltSignatures) {
         newSignatures.add(new SignatureDescriptor(sig.parameters(), elementTypeSet,
-          sig.bilingualDescription()));
+          sig.bilingualDescription(), sig.metadata()));
       }
       rebuiltSignatures = newSignatures;
     }

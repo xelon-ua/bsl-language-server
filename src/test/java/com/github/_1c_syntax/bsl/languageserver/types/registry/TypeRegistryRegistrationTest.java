@@ -23,6 +23,10 @@ package com.github._1c_syntax.bsl.languageserver.types.registry;
 
 import com.github._1c_syntax.bsl.languageserver.context.FileType;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.SourceDefinedSymbol;
+import com.github._1c_syntax.bsl.languageserver.types.model.Availability;
+import com.github._1c_syntax.bsl.languageserver.types.model.BilingualString;
+import com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor;
+import com.github._1c_syntax.bsl.languageserver.types.model.PlatformMetadata;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeKind;
 import com.github._1c_syntax.bsl.languageserver.util.CleanupContextBeforeClassAndAfterEachTestMethod;
 import org.junit.jupiter.api.Test;
@@ -31,6 +35,9 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+
+import java.util.List;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -102,6 +109,39 @@ class TypeRegistryRegistrationTest {
     assertThat(typeRegistry.resolve("Справочники.Контрагенты", FileType.OS))
       .as("конфигурационные типы недоступны в OS")
       .isEmpty();
+  }
+
+  @Test
+  void registerConfigurationTypeReusesRefAlreadyTakenByAnotherKind() {
+    // given — имя уже занято НЕ конфигурационным типом: так платформенная специализация
+    // (ОтчетОбъект.<Имя>) появляется раньше, чем модуль объекта до-регистрирует свои члены
+    var existing = typeRegistry.registerUserType("ОтчетОбъект.Продажи", declaration, FileType.BSL);
+
+    // when
+    var ref = typeRegistry.registerConfigurationType("ОтчетОбъект.Продажи");
+
+    // then — тот же ref, второго типа с тем же именем не появляется
+    assertThat(ref)
+      .as("одно qualifiedName — один TypeRef")
+      .isEqualTo(existing);
+    assertThat(typeRegistry.resolve("ОтчетОбъект.Продажи")).contains(existing);
+  }
+
+  @Test
+  void registerConfigurationTypeKeepsMembersRegisteredOnExistingRef() {
+    // given — у типа уже есть члены (события и встроенные реквизиты платформенного типа)
+    var existing = typeRegistry.registerUserType("ОтчетОбъект.Отгрузки", declaration, FileType.BSL);
+    typeRegistry.registerMemberSource(existing,
+      () -> List.of(MemberDescriptor.property("КомпоновщикНастроек")), FileType.BSL);
+
+    // when — модуль объекта до-регистрирует тот же тип
+    var ref = typeRegistry.registerConfigurationType("ОтчетОбъект.Отгрузки");
+
+    // then — члены достижимы по возвращённому ref'у: источники не разъехались по двум типам
+    assertThat(typeRegistry.getMembers(ref, FileType.BSL))
+      .as("getMembers собирает источники строго по своему ref — при втором ref'е члены терялись")
+      .extracting(MemberDescriptor::name)
+      .contains("КомпоновщикНастроек");
   }
 
   @Test
@@ -186,6 +226,44 @@ class TypeRegistryRegistrationTest {
 
     // then
     assertThat(typeRegistry.getDescription(ref, FileType.BSL)).isEqualTo("ru-описание");
+  }
+
+  @Test
+  void registerTypeMetadataStoresAndExposesByScope() {
+    // given
+    var ref = typeRegistry.registerUserType("ТМета", declaration, FileType.BSL);
+    var metadata = new PlatformMetadata(
+      "8.3.10", "8.3.27", List.of("Замена"),
+      Set.of(Availability.SERVER), null,
+      BilingualString.EMPTY, BilingualString.of("замечание"),
+      List.of(), List.of());
+
+    // when
+    typeRegistry.registerTypeMetadata(ref, metadata, FileType.BSL);
+
+    // then
+    assertThat(typeRegistry.getTypeMetadata(ref, FileType.BSL)).isEqualTo(metadata);
+    assertThat(typeRegistry.getTypeMetadata(ref, FileType.OS))
+      .as("метаданные видимы только в своём разрезе языка")
+      .isSameAs(PlatformMetadata.EMPTY);
+  }
+
+  @Test
+  void registerTypeMetadataIgnoresEmptyMetadata() {
+    // given
+    var ref = typeRegistry.registerUserType("ТМета2", declaration, FileType.BSL);
+    var metadata = new PlatformMetadata(
+      "8.3.10", "", List.of(), Set.of(), null,
+      BilingualString.EMPTY, BilingualString.of("замечание"),
+      List.of(), List.of());
+
+    // when — пустые метаданные не занимают место в индексе, поэтому следующая
+    // регистрация не упирается в «первая выигрывает»
+    typeRegistry.registerTypeMetadata(ref, PlatformMetadata.EMPTY, FileType.BSL);
+    typeRegistry.registerTypeMetadata(ref, metadata, FileType.BSL);
+
+    // then
+    assertThat(typeRegistry.getTypeMetadata(ref, FileType.BSL)).isEqualTo(metadata);
   }
 
   @Test
@@ -426,5 +504,69 @@ class TypeRegistryRegistrationTest {
     if (lower.isPresent() || mixed.isPresent()) {
       assertThat(lower).isEqualTo(mixed);
     }
+  }
+
+  /**
+   * Регресс: платформенная специализация ({@code ОтчетОбъект.<Имя>}, kind PLATFORM)
+   * несёт события; когда модуль объекта до-регистрирует свои члены через
+   * {@code registerConfigurationType} того же имени, событие НЕ должно исчезнуть
+   * (инвариант «одно имя ↔ один TypeRef»: registerConfigurationType переиспользует
+   * существующий ref, а не плодит теневой CONFIGURATION-ref). Ровно этот баг ронял
+   * классификацию {@code ПриКомпоновкеРезультата} у отчётов после populateContext.
+   */
+  @Test
+  void registerConfigurationTypeReusesExistingPlatformRefAndKeepsEvents() {
+    // given — generic ОтчетОбъект.<Имя отчёта> с событием, и его специализация (kind PLATFORM).
+    var generic = typeRegistry.intern(TypeKind.PLATFORM, "ТестОбъект.<Имя>");
+    var event = com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor.event(
+      "ПриКомпоновкеРезультата", "", java.util.List.of());
+    typeRegistry.registerMemberSource(generic, () -> java.util.List.of(event), FileType.BSL);
+    var specialized = typeRegistry.registerSpecialization(
+      "ТестОбъект.Мой", generic, java.util.Map.of(), FileType.BSL);
+    assertThat(specialized.kind()).isEqualTo(TypeKind.PLATFORM);
+
+    // when — модуль объекта до-регистрирует собственный метод на тот же тип.
+    var ref = typeRegistry.registerConfigurationType("ТестОбъект.Мой");
+    var method = com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor.method(
+      "МойМетод", "", java.util.List.of());
+    typeRegistry.registerMemberSource(ref, () -> java.util.List.of(method), FileType.BSL);
+
+    // then — тот же ref (не теневой CONFIGURATION), и событие соседствует с методом модуля.
+    assertThat(ref).isSameAs(specialized);
+    assertThat(typeRegistry.resolve("ТестОбъект.Мой")).contains(specialized);
+    var memberNames = typeRegistry.getMembers(specialized, FileType.BSL).stream()
+      .map(com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor::name)
+      .toList();
+    assertThat(memberNames).contains("ПриКомпоновкеРезультата", "МойМетод");
+  }
+
+  /**
+   * Симметрия рельс: тот же результат при обратном порядке (сначала конфигурационный
+   * тип объекта — как у справочников/документов через {@code registerObjectAndRefTypes},
+   * затем платформенная специализация досыпает события). Оба пути сходятся на один ref.
+   */
+  @Test
+  void specializationReusesExistingConfigurationRefAndKeepsBothMemberSets() {
+    // given — сначала конфигурационный тип объекта со «своим» членом (kind CONFIGURATION).
+    var ref = typeRegistry.registerConfigurationType("Тест2Объект.Мой");
+    assertThat(ref.kind()).isEqualTo(TypeKind.CONFIGURATION);
+    var method = com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor.method(
+      "МойМетод", "", java.util.List.of());
+    typeRegistry.registerMemberSource(ref, () -> java.util.List.of(method), FileType.BSL);
+
+    // when — платформенная специализация того же имени досыпает событие.
+    var generic = typeRegistry.intern(TypeKind.PLATFORM, "Тест2Объект.<Имя>");
+    var event = com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor.event(
+      "ПриКомпоновкеРезультата", "", java.util.List.of());
+    typeRegistry.registerMemberSource(generic, () -> java.util.List.of(event), FileType.BSL);
+    var specialized = typeRegistry.registerSpecialization(
+      "Тест2Объект.Мой", generic, java.util.Map.of(), FileType.BSL);
+
+    // then — специализация переиспользовала существующий CONFIGURATION-ref, члены слиты.
+    assertThat(specialized).isSameAs(ref);
+    var memberNames = typeRegistry.getMembers(ref, FileType.BSL).stream()
+      .map(com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor::name)
+      .toList();
+    assertThat(memberNames).contains("ПриКомпоновкеРезультата", "МойМетод");
   }
 }

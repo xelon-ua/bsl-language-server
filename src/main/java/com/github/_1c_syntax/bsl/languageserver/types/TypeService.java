@@ -26,7 +26,9 @@ import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
 import com.github._1c_syntax.bsl.languageserver.context.FileType;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.MethodSymbol;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.ModuleSymbol;
+import com.github._1c_syntax.bsl.languageserver.context.symbol.SelfMemberClassifier;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.SourceDefinedSymbol;
+import com.github._1c_syntax.bsl.languageserver.context.symbol.VariableSymbol;
 import com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceScope;
 import com.github._1c_syntax.bsl.languageserver.references.ReferenceResolver;
 import com.github._1c_syntax.bsl.languageserver.references.model.Reference;
@@ -34,11 +36,14 @@ import com.github._1c_syntax.bsl.languageserver.types.index.SymbolTypeIndex;
 import com.github._1c_syntax.bsl.languageserver.types.inferencer.ExpressionAtPosition;
 import com.github._1c_syntax.bsl.languageserver.types.inferencer.ExpressionTypeInferencer;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor;
+import com.github._1c_syntax.bsl.languageserver.types.model.MemberKind;
+import com.github._1c_syntax.bsl.languageserver.types.model.PlatformMetadata;
 import com.github._1c_syntax.bsl.languageserver.types.model.SignatureDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeKind;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeRef;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeSet;
 import com.github._1c_syntax.bsl.languageserver.types.model.UserType;
+import com.github._1c_syntax.bsl.languageserver.types.registry.ConfigurationModuleMembersProvider;
 import com.github._1c_syntax.bsl.languageserver.types.registry.GlobalScopeProvider;
 import com.github._1c_syntax.bsl.languageserver.types.registry.TypeRegistry;
 import com.github._1c_syntax.bsl.languageserver.types.symbol.PlatformMemberSymbol;
@@ -46,6 +51,8 @@ import com.github._1c_syntax.bsl.languageserver.utils.Ranges;
 import com.github._1c_syntax.bsl.languageserver.utils.Trees;
 import com.github._1c_syntax.bsl.parser.BSLParser;
 import lombok.RequiredArgsConstructor;
+import org.antlr.v4.runtime.ParserRuleContext;
+import org.antlr.v4.runtime.tree.ParseTree;
 import org.antlr.v4.runtime.tree.TerminalNode;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.Range;
@@ -66,7 +73,7 @@ import java.util.Optional;
 @Component
 @WorkspaceScope
 @RequiredArgsConstructor
-public class TypeService {
+public class TypeService implements SelfMemberClassifier {
 
   private final TypeRegistry typeRegistry;
   private final SymbolTypeIndex symbolTypeIndex;
@@ -84,9 +91,10 @@ public class TypeService {
    * @return набор типов значения ссылки; {@link TypeSet#EMPTY}, если тип не определяется.
    */
   public TypeSet typesAt(Reference reference) {
-    var sourceDefined = reference.getSourceDefinedSymbol();
-    if (sourceDefined.isPresent()) {
-      return inferencer.inferSymbol(sourceDefined.get());
+    if (reference.getSourceDefinedSymbol().isPresent()) {
+      // Ссылка позиционна, поэтому и ответ позиционный: тип переменной берётся в точке
+      // ссылки — с учётом присваиваний и вставок, случившихся на путях к ней.
+      return inferencer.inferVariableAt(reference);
     }
     if (reference.symbol() instanceof PlatformMemberSymbol platformMember) {
       var returnTypes = platformMember.getDescriptor().returnTypes();
@@ -95,6 +103,72 @@ public class TypeService {
       }
     }
     return TypeSet.EMPTY;
+  }
+
+  /**
+   * Тип переменной в указанной точке её документа — позиционный ответ там, где обращения
+   * к переменной в этой точке нет и {@link Reference} не существует.
+   *
+   * @param variable переменная.
+   * @param position точка в документе переменной.
+   * @return набор типов в этой точке.
+   */
+  public TypeSet typesOfVariableAt(VariableSymbol variable, Position position) {
+    return inferencer.inferVariableAt(variable, position);
+  }
+
+  /**
+   * {@inheritDoc}
+   * <p>
+   * Делегирует в {@link #findSelfMember} с {@link MemberKind#PROPERTY}: self-тип
+   * модуля и его реквизиты берутся из реестра типов (метаданные конфигурации),
+   * а не из {@code SymbolTree} самого модуля, поэтому вызов безопасен и при
+   * построении дерева символов (см. {@link SelfMemberClassifier}).
+   */
+  @Override
+  public boolean isBareSelfProperty(DocumentContext documentContext, String name) {
+    return findSelfMember(documentContext, name, MemberKind.PROPERTY).isPresent();
+  }
+
+  /**
+   * Член self-типа текущего модуля (реквизит/платформенный метод объекта,
+   * набора записей, менеджера, общего модуля, встроенный член OScript-класса),
+   * доступный внутри модуля без квалификации. Self-тип — тот же, что и у
+   * dot-completion ({@link GlobalScopeProvider#moduleTypeRefByUri(java.net.URI)});
+   * если он для документа не зарегистрирован — всегда empty.
+   *
+   * @param documentContext документ, из которого происходит обращение.
+   * @param name            имя члена (без учёта регистра, ru/en-написания).
+   * @param kind            требуемый вид члена: {@link MemberKind#METHOD} для
+   *                        вызова {@code Имя(...)}, {@link MemberKind#PROPERTY}
+   *                        для голой ссылки на имя.
+   * @return найденный член; empty, если self-типа нет или член не найден.
+   */
+  public Optional<MemberDescriptor> findSelfMember(DocumentContext documentContext, String name, MemberKind kind) {
+    return selfTypeRef(documentContext)
+      .flatMap(ref -> typeRegistry.findMember(ref, kind, name, documentContext.getFileType()));
+  }
+
+  /**
+   * Self-тип модуля документа. Быстрый путь — кэш {@code moduleTypeRefByUri}; если он ещё
+   * пуст (его наполняет {@code ConfigurationModuleMembersProvider.register} на
+   * {@code DocumentContextContentChangedEvent} — уже ПОСЛЕ построения дерева, оно
+   * строится внутри {@code DocumentContext.rebuild}, а событие AOP публикует после
+   * возврата) — резолвим тип конфигурационного модуля <b>из метаданных напрямую</b>.
+   * <p>
+   * Без этого self-члены присваиваемых реквизитов ({@code Реквизит = …}) на первой
+   * сборке дерева не распознавались бы, и {@code VariableSymbolComputer} заводил бы на
+   * них фантомную DYNAMIC-переменную, затеняющую реквизит до первой правки файла.
+   * Тот же приём, что у {@code EventHandlerResolver.resolveOwnerType}.
+   */
+  private Optional<TypeRef> selfTypeRef(DocumentContext documentContext) {
+    var cached = globalScopeProvider.moduleTypeRefByUri(documentContext.getUri());
+    if (cached.isPresent()) {
+      return cached;
+    }
+    return documentContext.getMdObject()
+      .flatMap(md -> ConfigurationModuleMembersProvider.selfTypeQualifiedName(documentContext.getModuleType(), md))
+      .flatMap(typeRegistry::resolve);
   }
 
   /**
@@ -121,8 +195,9 @@ public class TypeService {
    * @return список наборов типов по параметрам, в порядке объявления.
    */
    public List<TypeSet> getParameterTypes(MethodSymbol method) {
+     var owner = method.getOwner();
      return method.getParameters().stream()
-       .map(symbolTypeIndex::getDeclaredParameterTypes)
+       .map(parameter -> symbolTypeIndex.getDeclaredParameterTypes(parameter, owner))
        .toList();
    }
 
@@ -224,6 +299,20 @@ public class TypeService {
   }
 
   /**
+   * «Страничные» метаданные самого типа из синтакс-помощника: доступность по
+   * видам клиента, версии появления/устаревания с рекомендуемыми заменами,
+   * «Замечание», «Пример», «См. также». Метаданные членов типа живут на
+   * {@link MemberDescriptor#metadata()}.
+   *
+   * @param typeRef  тип.
+   * @param fileType тип файла-потребителя (BSL/OS).
+   * @return метаданные; {@link PlatformMetadata#EMPTY}, если источник их не дал.
+   */
+  public PlatformMetadata getTypeMetadata(TypeRef typeRef, FileType fileType) {
+    return typeRegistry.getTypeMetadata(typeRef, fileType);
+  }
+
+  /**
    * Имя типа для отображения в указанной локали LS (ru/en, с fallback).
    *
    * @param typeRef тип.
@@ -246,7 +335,7 @@ public class TypeService {
    *       ({@code ПриСозданииОбъекта}) — см. ниже;</li>
    *   <li>{@link TypeKind#CONFIGURATION} — общие модули и модули менеджеров объектов
    *       конфигурации: документ-модуль находится обратным индексом
-   *       {@link GlobalScopeProvider#moduleUriByType(TypeRef)}, а его символ —
+   *       {@link GlobalScopeProvider#uriByModuleTypeRef(TypeRef)}, а его символ —
    *       {@code getSymbolTree().getModule()}.</li>
    * </ul>
    * Для платформенных/примитивных типов ({@link TypeKind#PLATFORM},
@@ -281,6 +370,55 @@ public class TypeService {
   }
 
   /**
+   * Разрешить имя или квалифицированную ссылку в символ-определение того, что она
+   * обозначает.
+   * <p>
+   * Ссылка не привязана к {@code См.}: это может быть метод, общий модуль, менеджер
+   * справочника/документа и вообще любой тип, имеющий отражение в виде модуля.
+   * <ul>
+   *   <li>неквалифицированное имя ({@code Метод}) — метод того же модуля (функция
+   *       или процедура);</li>
+   *   <li>квалифицированная ссылка на член ({@code Модуль.Метод},
+   *       {@code Справочники.X.Метод}, {@code Тип.Член}) — тем же обходом цепочки
+   *       членов, что и резолв типа по строке
+   *       ({@link SymbolTypeIndex#resolveReferenceSymbol}), единообразно для общих
+   *       модулей, модулей менеджеров и прочих типов;</li>
+   *   <li>имя типа целиком ({@code ОбщийМодуль}, {@code Справочники.Номенклатура}) —
+   *       его определяющий символ ({@link #definingSymbol}).</li>
+   * </ul>
+   *
+   * @param reference         имя/квалифицированная ссылка (например, текст
+   *                          {@code См.}-ссылки без ключевого слова).
+   * @param requestingContext документ, относительно которого резолвится ссылка.
+   * @return символ-определение цели, либо {@code empty}.
+   */
+  public Optional<SourceDefinedSymbol> resolveDefinition(String reference, DocumentContext requestingContext) {
+    if (reference.isBlank()) {
+      return Optional.empty();
+    }
+    var fileType = requestingContext.getFileType();
+    if (reference.indexOf('.') < 0) {
+      // Метод того же модуля (функция или процедура) — по неквалифицированному имени.
+      var localMethod = requestingContext.getSymbolTree()
+        .getMethodSymbol(reference)
+        .map(SourceDefinedSymbol.class::cast);
+      if (localMethod.isPresent()) {
+        return localMethod;
+      }
+    } else {
+      // Квалифицированная ссылка на член (Модуль.Метод, Справочники.X.Метод,
+      // Тип.Член) — тем же обходом цепочки, что и резолв типа по строке.
+      var member = symbolTypeIndex.resolveReferenceSymbol(reference, fileType);
+      if (member.isPresent()) {
+        return member;
+      }
+    }
+    // Ссылка на имя типа (общий модуль целиком, справочник и т.п.) — его
+    // определяющий символ. Тот же fallback на имя типа, что и у резолва типа по строке.
+    return resolve(reference, fileType).flatMap(typeRef -> definingSymbol(typeRef, requestingContext));
+  }
+
+  /**
    * Для символа-модуля OneScript-класса предпочесть символ конструктора
    * {@code ПриСозданииОбъекта}, если он есть; иначе вернуть сам символ-модуль
    * без изменений.
@@ -305,7 +443,7 @@ public class TypeService {
     TypeRef typeRef,
     DocumentContext requestingContext
   ) {
-    return globalScopeProvider.moduleUriByType(typeRef)
+    return globalScopeProvider.uriByModuleTypeRef(typeRef)
       .map(uri -> requestingContext.getServerContext().getDocument(uri))
       .<SourceDefinedSymbol>map(documentContext -> documentContext.getSymbolTree().getModule());
   }
@@ -321,7 +459,7 @@ public class TypeService {
   public Optional<URI> definingUri(TypeRef typeRef) {
     return switch (typeRef.kind()) {
       case USER -> userTypeDeclaration(typeRef).map(symbol -> symbol.getOwner().getUri());
-      case CONFIGURATION -> globalScopeProvider.moduleUriByType(typeRef);
+      case CONFIGURATION -> globalScopeProvider.uriByModuleTypeRef(typeRef);
       default -> Optional.empty();
     };
   }
@@ -447,6 +585,14 @@ public class TypeService {
   }
 
   /**
+   * Вариант {@link #memberAt(DocumentContext, Position)} от уже известного
+   * терминала — без спуска по AST к позиции (см. {@link #membersAt(DocumentContext, TerminalNode)}).
+   */
+  public Optional<TypedMember> memberAt(DocumentContext documentContext, TerminalNode terminal) {
+    return membersAt(documentContext, terminal).stream().findFirst();
+  }
+
+  /**
    * То же, что {@link #memberAt(DocumentContext, Position)}, но возвращает
    * <b>все</b> члены-кандидаты, когда тип ресивера выведен как union из
    * нескольких типов (например, переменная присваивается значениями разных
@@ -465,6 +611,24 @@ public class TypeService {
     if (terminal == null) {
       return List.of();
     }
+    return membersAt(documentContext, terminal);
+  }
+
+  /**
+   * То же, что {@link #membersAt(DocumentContext, Position)}, но для случая,
+   * когда терминал-идентификатор уже известен вызывающему (например, получен
+   * при обходе AST). Избавляет от повторного спуска по дереву ради поиска
+   * терминала по позиции — на больших модулях это доминирующая стоимость.
+   * Не-идентификаторный терминал даёт пустой список (как и поиск по позиции).
+   *
+   * @param documentContext контекст документа.
+   * @param terminal терминал-идентификатор члена/имени.
+   * @return все члены-кандидаты для терминала; пустой список, если члена нет.
+   */
+  public List<TypedMember> membersAt(DocumentContext documentContext, TerminalNode terminal) {
+    if (terminal.getSymbol().getType() != BSLParser.IDENTIFIER) {
+      return List.of();
+    }
     // Случай глобальной функции / свойства / library-модуля (например,
     // КодировкаТекста, ФС) — резолвится напрямую, без инференса ресивера.
     if (!isAccessorIdentifier(terminal)) {
@@ -473,7 +637,7 @@ public class TypeService {
         return List.of(bare.get());
       }
     }
-    return dereferenceMatcher.matchAt(terminal, documentContext, position);
+    return dereferenceMatcher.matchAt(terminal, documentContext);
   }
 
   /**
@@ -486,8 +650,9 @@ public class TypeService {
   }
 
   /**
-   * Резолв голого имени (не аксессора): глобальная функция (владелец = null)
-   * либо глобальное свойство / library-модуль. Empty, если имя так не резолвится.
+   * Резолв голого имени (не аксессора): глобальная функция (владелец = null),
+   * глобальное свойство / library-модуль, либо неквалифицированный self-член
+   * текущего модуля. Empty, если имя так не резолвится.
    */
   private Optional<TypedMember> resolveBareName(TerminalNode terminal, DocumentContext documentContext) {
     var bareName = terminal.getText();
@@ -500,7 +665,7 @@ public class TypeService {
 
     // Глобальное свойство (перечисление/менеджер коллекции/модуль); имена типов
     // для `Новый` (TYPE_NAME) глобальными свойствами не являются.
-    return globalScopeProvider.globalProperty(bareName, fileType)
+    var globalProp = globalScopeProvider.globalProperty(bareName, fileType)
       .map(member -> member.returnTypes().refs().stream()
         .filter(r -> !r.equals(TypeRef.UNKNOWN)).findFirst().orElse(TypeRef.UNKNOWN))
       .filter(ref -> !ref.equals(TypeRef.UNKNOWN))
@@ -511,6 +676,61 @@ public class TypeService {
           MemberDescriptor.property(ref.qualifiedName(), ref, desc),
           Ranges.create(terminal));
       });
+    if (globalProp.isPresent()) {
+      return globalProp;
+    }
+
+    return resolveSelfMember(terminal, bareName, documentContext);
+  }
+
+  /**
+   * Неквалифицированное обращение к члену self-типа текущего модуля (реквизит/
+   * платформенный метод объекта/менеджера/набора записей/общего модуля,
+   * встроенный член OScript-класса) — тот же self-тип, что и у dot-completion
+   * ({@link GlobalScopeProvider#moduleTypeRefByUri(java.net.URI)}). Вид члена определяется
+   * контекстом обращения: вызов ({@code Имя(...)}) — {@link MemberKind#METHOD},
+   * иначе — {@link MemberKind#PROPERTY} (голый идентификатор без вызова не
+   * может ссылаться на метод).
+   */
+  private Optional<TypedMember> resolveSelfMember(
+    TerminalNode terminal, String name, DocumentContext documentContext
+  ) {
+    // Объявленная одноимённая переменная/параметр в области видимости перекрывает
+    // self-член: голое имя тогда ссылается на переменную (её типизирует
+    // reference-путь), а не на реквизит/метод объекта. Проверка живёт здесь, в
+    // резолве, а не у каждого потребителя (диагностика, hover) — единый источник
+    // правила затенения на этом пути.
+    if (isShadowedByLocalVariable(terminal, documentContext, name)) {
+      return Optional.empty();
+    }
+    var selfType = selfTypeRef(documentContext);
+    if (selfType.isEmpty()) {
+      return Optional.empty();
+    }
+    var expectedKind = isGlobalMethodCallName(terminal) ? MemberKind.METHOD : MemberKind.PROPERTY;
+    return findSelfMember(documentContext, name, expectedKind)
+      .map(member -> new TypedMember(selfType.get(), member, Ranges.create(terminal)));
+  }
+
+  /**
+   * Голое имя {@code name} затенено объявленной переменной/параметром, видимым в
+   * точке {@code terminal}: сперва — в охватывающем методе, иначе — на уровне
+   * модуля. Такое имя ссылается на переменную, а не на self-член (тот же порядок
+   * резолва имени в BSL, что и у индексатора self-членов в
+   * {@code ReferenceIndexFiller}). Для настоящего self-члена пусто: голое
+   * присваивание одноимённому реквизиту без {@code Перем} переменной не создаёт
+   * (см. {@link SelfMemberClassifier}).
+   */
+  private static boolean isShadowedByLocalVariable(TerminalNode terminal, DocumentContext documentContext,
+                                                   String name) {
+    return terminal.getParent() instanceof ParserRuleContext ctx
+      && documentContext.getSymbolTree().getVariableSymbolInScope(ctx, name).isPresent();
+  }
+
+  /** Терминал — имя безточечного вызова ({@code Имя(...)}, без ресивера). */
+  private static boolean isGlobalMethodCallName(TerminalNode terminal) {
+    return terminal.getParent() instanceof BSLParser.MethodNameContext methodName
+      && methodName.getParent() instanceof BSLParser.GlobalMethodCallContext;
   }
 
   /**
@@ -537,6 +757,63 @@ public class TypeService {
   }
 
   /**
+   * Вариант {@link #unknownMemberReceiverAt(DocumentContext, Position)} от уже
+   * известного терминала-члена — без спуска по AST к позиции.
+   * <p>
+   * Тип ресивера выводится за один проход через dereference-инференс
+   * ({@link DereferenceMemberMatcher#matchWithReceiverAt}). Если он пуст, ресивер
+   * добирается по <b>завершающему идентификатору</b> ресивера (перед точкой),
+   * резолвленному терминально через индекс ссылок. Тип охватывающего выражения
+   * ({@code expressionTypesAt}) здесь <b>намеренно не используется</b>: он накрыл
+   * бы всё {@code Ресивер.Член} и вернул тип операции (например {@code Булево} у
+   * сравнения {@code Ресивер.Член = …}), из-за чего член проверялся бы у неверного
+   * типа — ложное срабатывание. Такой fallback уместен лишь для висячей точки
+   * ({@code Ресивер.|}) в completion, но не для диагностики с завершённым членом.
+   */
+  public Optional<TypeSet> unknownMemberReceiverAt(DocumentContext documentContext, TerminalNode terminal) {
+    var match = dereferenceMatcher.matchWithReceiverAt(terminal, documentContext);
+    if (!match.members().isEmpty()) {
+      return Optional.empty();
+    }
+    var receiver = match.receiverTypes();
+    if (receiver.isEmpty()) {
+      receiver = receiverEndIdentifier(terminal)
+        .flatMap(receiverEnd -> referenceResolver.findReference(documentContext.getUri(), receiverEnd))
+        .map(this::typesAt)
+        .orElse(TypeSet.EMPTY);
+    }
+    return allConcrete(receiver) ? Optional.of(receiver) : Optional.empty();
+  }
+
+  /**
+   * Завершающий идентификатор ресивера для члена {@code Ресивер.Член}: последний
+   * именованный сегмент перед точкой члена. По AST-цепочке доступа — предыдущий
+   * {@code accessProperty} того же {@link BSLParser.ComplexIdentifierContext} (для
+   * {@code А.Б.В|} это {@code Б}), либо головной {@code IDENTIFIER} для первого
+   * члена ({@code А.Б|} → {@code А}). Пусто, если ресивер оканчивается вызовом или
+   * индексом (не именованный символ — по индексу ссылок не резолвится).
+   */
+  private static Optional<TerminalNode> receiverEndIdentifier(TerminalNode member) {
+    ParseTree node = member.getParent();
+    while (node != null && !(node instanceof BSLParser.ModifierContext)) {
+      node = node.getParent();
+    }
+    if (node == null || !(node.getParent() instanceof BSLParser.ComplexIdentifierContext chain)) {
+      return Optional.empty();
+    }
+    var modifiers = chain.modifier();
+    var index = modifiers.indexOf(node);
+    if (index < 0) {
+      return Optional.empty();
+    }
+    if (index == 0) {
+      return Optional.ofNullable(chain.IDENTIFIER());
+    }
+    var previous = modifiers.get(index - 1).accessProperty();
+    return previous == null ? Optional.empty() : Optional.ofNullable(previous.IDENTIFIER());
+  }
+
+  /**
    * Голый вызов {@code Имя(...)}, который не резолвится ни в глобальную функцию/
    * свойство/перечисление платформы или конфигурации, ни в source-defined символ
    * (метод/переменная текущего модуля). Вероятный вызов несуществующего метода.
@@ -551,6 +828,17 @@ public class TypeService {
   public boolean isUnknownGlobalAt(DocumentContext documentContext, Position position) {
     return membersAt(documentContext, position).isEmpty()
       && referenceResolver.findReference(documentContext.getUri(), position).isEmpty();
+  }
+
+  /**
+   * Вариант {@link #isUnknownGlobalAt(DocumentContext, Position)} от уже
+   * известного терминала-имени — без спуска по AST к позиции. Терминал
+   * прокидывается и в {@link ReferenceResolver}, чтобы reference-finder'ы тоже
+   * резолвили его подъёмом, а не спуском от корня.
+   */
+  public boolean isUnknownGlobalAt(DocumentContext documentContext, TerminalNode terminal) {
+    return membersAt(documentContext, terminal).isEmpty()
+      && referenceResolver.findReference(documentContext.getUri(), terminal).isEmpty();
   }
 
   /**
@@ -572,7 +860,7 @@ public class TypeService {
    */
   public TypeSet receiverTypesAt(DocumentContext documentContext, Position position) {
     var viaMember = identifierTerminalAt(documentContext, position)
-      .flatMap(terminal -> dereferenceMatcher.receiverTypesAt(documentContext, position, terminal))
+      .flatMap(terminal -> dereferenceMatcher.receiverTypesAt(documentContext, terminal))
       .orElse(TypeSet.EMPTY);
     if (!viaMember.isEmpty()) {
       return viaMember;
@@ -591,13 +879,72 @@ public class TypeService {
    * здесь нельзя: он накрыл бы незавершённое {@code Ресивер.Член} и не разрешил член.
    */
   private TypeSet receiverSegmentTypes(DocumentContext documentContext, Position receiverEnd) {
-    var fromIndex = referenceResolver.findReference(documentContext.getUri(), receiverEnd)
-      .map(this::typesAt)
-      .orElse(TypeSet.EMPTY);
-    if (!fromIndex.isEmpty()) {
+    var reference = referenceResolver.findReference(documentContext.getUri(), receiverEnd).orElse(null);
+    var fromIndex = reference == null ? TypeSet.EMPTY : typesAt(reference);
+    // Ссылка на переменную уже дала позиционный ответ — сравнивать не с чем, а расчёт
+    // выражения в той же точке был бы вторым таким же проходом по методу.
+    if (!fromIndex.isEmpty() && isVariableReference(reference)) {
       return fromIndex;
     }
-    return expressionTypesAt(documentContext, receiverEnd);
+    var fromExpression = expressionTypesAt(documentContext, receiverEnd);
+    if (fromIndex.isEmpty()) {
+      return fromExpression;
+    }
+    // Индекс ссылок отдаёт тип символа целиком, а инференс считает его в этой точке кода:
+    // внутри ветки с проверкой типа набор сужен. Более узкий набор — точнее.
+    if (narrowsSameTypes(fromExpression, fromIndex)) {
+      return fromExpression;
+    }
+    // Индекс ссылок отдаёт ОБЪЯВЛЕННЫЙ тип члена, без уточнений, добытых на месте:
+    // у `ТЗ.Колонки` это просто коллекция колонок, без самих колонок, а у
+    // `ТЧ.ВыгрузитьКолонку("Цена")` — нетипизированный массив. Если инференс дал те
+    // же типы, но с уточнениями, берём его: он строго информативнее.
+    return refinesSameTypes(fromExpression, fromIndex) ? fromExpression : fromIndex;
+  }
+
+  /**
+   * Ведёт ли ссылка на переменную или параметр.
+   *
+   * @param reference ссылка; {@code null} — ссылки нет.
+   * @return {@code true}, если ссылка указывает на переменную.
+   */
+  private static boolean isVariableReference(@Nullable Reference reference) {
+    return reference != null
+      && reference.getSourceDefinedSymbol().orElse(null) instanceof VariableSymbol;
+  }
+
+  /**
+   * Сужает ли {@code candidate} набор {@code base}: непустое строгое подмножество его
+   * типов. Так выглядит результат проверки типа в коде — набор в этой точке уже, чем
+   * объявленный у символа.
+   *
+   * @param candidate проверяемый набор.
+   * @param base      набор, с которым сравнивается.
+   * @return {@code true}, если кандидат — непустое строгое подмножество базы.
+   */
+  private static boolean narrowsSameTypes(TypeSet candidate, TypeSet base) {
+    return !candidate.isEmpty()
+      && candidate.size() < base.size()
+      && base.refs().containsAll(candidate.refs());
+  }
+
+  /**
+   * Уточняет ли {@code candidate} тот же набор типов, что и {@code base}: типы те же,
+   * но у кандидата есть типы элементов или поля «открытого» объекта, которых нет у базы.
+   */
+  private static boolean refinesSameTypes(TypeSet candidate, TypeSet base) {
+    if (!candidate.refs().equals(base.refs())) {
+      return false;
+    }
+    for (var ref : candidate.refs()) {
+      var richerElements = !candidate.getElementTypes(ref).isEmpty()
+        && base.getElementTypes(ref).isEmpty();
+      var richerFields = candidate.getLocalFields(ref).size() > base.getLocalFields(ref).size();
+      if (richerElements || richerFields) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -611,7 +958,7 @@ public class TypeService {
       return Optional.empty();
     }
     var line = lines[position.getLine()];
-    var col = Math.min(position.getCharacter(), line.length());
+    var col = Math.clamp(position.getCharacter(), 0, line.length());
     var i = col;
     while (i > 0 && isIdentChar(line.charAt(i - 1))) {
       i--;

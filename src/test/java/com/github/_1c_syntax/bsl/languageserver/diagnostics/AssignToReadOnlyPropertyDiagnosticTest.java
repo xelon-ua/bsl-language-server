@@ -21,7 +21,9 @@
  */
 package com.github._1c_syntax.bsl.languageserver.diagnostics;
 
+import com.github._1c_syntax.bsl.languageserver.context.FileType;
 import com.github._1c_syntax.bsl.languageserver.diagnostics.metadata.DiagnosticMessage;
+import com.github._1c_syntax.bsl.languageserver.types.model.AccessMode;
 import com.github._1c_syntax.bsl.languageserver.types.registry.TypeRegistry;
 import com.github._1c_syntax.bsl.languageserver.util.CleanupContextBeforeClassAndAfterClass;
 import com.github._1c_syntax.bsl.languageserver.util.TestUtils;
@@ -96,6 +98,75 @@ class AssignToReadOnlyPropertyDiagnosticTest extends AbstractDiagnosticTest<Assi
       .as("без MD-контекста типы локальной переменной не резолвятся, "
         + "false positives недопустимы")
       .isEmpty();
+  }
+
+  /**
+   * Ссылка у <b>объекта</b> справочника тоже read-only, и метка должна доходить до
+   * специализации {@code СправочникОбъект.<Имя>}, а не только до generic'а: диагностика
+   * решает по {@code accessMode} резолвленного члена конкретного типа-владельца.
+   */
+  @Test
+  void catalogObjectReferenceAttributeIsReadOnlyOnSpecialization() {
+    initServerContext(PATH_TO_METADATA);
+    context.getConfiguration();
+
+    var objectType = typeRegistry.resolve("СправочникОбъект.Справочник1").orElseThrow();
+
+    assertThat(typeRegistry.getMembers(objectType, FileType.BSL))
+      .filteredOn(member -> member.matches("Ссылка"))
+      .as("read-only-метка должна наследоваться специализацией объектного типа")
+      .isNotEmpty()
+      .allMatch(member -> member.metadata().accessMode() == AccessMode.READ);
+  }
+
+  @Test
+  void detectsBareAssignmentToReadOnlySelfMemberInObjectModule() {
+    initServerContext(PATH_TO_METADATA);
+    context.getConfiguration();
+    var uri = Path.of(
+      "./src/test/resources/metadata/designer/Catalogs/Справочник1/Ext/ObjectModule.bsl").toUri();
+    // Голое присваивание стандартному реквизиту Ссылка — обращение к read-only
+    // self-члену СправочникОбъект.Справочник1, а не к отдельной переменной.
+    var content = """
+      Процедура Тест()
+      	Ссылка = 3;
+      КонецПроцедуры
+      """;
+    var documentContext = TestUtils.getDocumentContext(uri, content, context);
+    try {
+      var diagnostics = getDiagnostics(documentContext);
+      assertThat(diagnostics)
+        .as("голое присваивание read-only реквизиту Ссылка объекта должно подсвечиваться")
+        .hasSize(1);
+      assertThat(DiagnosticMessage.getStringValue(diagnostics.get(0).getMessage()))
+        .contains("Ссылка");
+    } finally {
+      context.removeDocument(documentContext.getUri());
+    }
+  }
+
+  @Test
+  void noAssignmentWhenReadOnlyNameShadowedByLocalVariable() {
+    initServerContext(PATH_TO_METADATA);
+    context.getConfiguration();
+    var uri = Path.of(
+      "./src/test/resources/metadata/designer/Catalogs/Справочник1/Ext/ObjectModule.bsl").toUri();
+    // Локальная переменная Ссылка затеняет self-реквизит — присваивание идёт
+    // переменной, read-only-проверка неприменима, false positive недопустим.
+    var content = """
+      Процедура Тест()
+      	Перем Ссылка;
+      	Ссылка = 3;
+      КонецПроцедуры
+      """;
+    var documentContext = TestUtils.getDocumentContext(uri, content, context);
+    try {
+      assertThat(getDiagnostics(documentContext))
+        .as("затенённое локальной переменной имя не должно давать read-only-замечание")
+        .isEmpty();
+    } finally {
+      context.removeDocument(documentContext.getUri());
+    }
   }
 
   @Test

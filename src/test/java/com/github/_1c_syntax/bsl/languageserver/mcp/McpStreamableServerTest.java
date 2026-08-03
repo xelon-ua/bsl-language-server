@@ -64,7 +64,27 @@ class McpStreamableServerTest {
     assertThat(toolNames)
       .containsExactlyInAnyOrder(
         "analyze_file", "document_symbols", "find_references", "call_hierarchy", "hover", "definition",
-        "type_info", "type_at_position", "global_member_info");
+        "type_info", "type_at_position", "global_member_info", "global_member_search");
+  }
+
+  @Test
+  void allToolsAreMarkedReadOnly() {
+    // Все инструменты только читают код и ничего не меняют — клиент (например, Claude) не должен
+    // считать их разрушающими и спрашивать подтверждение на каждый вызов.
+    var tools = mcpSyncServer.listTools();
+
+    assertThat(tools).isNotEmpty();
+    assertThat(tools).allSatisfy(tool -> {
+      assertThat(tool.annotations())
+        .as("tool '%s' must carry read-only annotations", tool.name())
+        .isNotNull();
+      assertThat(tool.annotations().readOnlyHint())
+        .as("tool '%s' must be read-only", tool.name())
+        .isTrue();
+      assertThat(tool.annotations().destructiveHint())
+        .as("tool '%s' must not be destructive", tool.name())
+        .isFalse();
+    });
   }
 
   @Test

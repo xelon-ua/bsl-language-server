@@ -21,7 +21,6 @@
  */
 package com.github._1c_syntax.bsl.languageserver.diagnostics;
 
-import com.github._1c_syntax.bsl.languageserver.utils.DiagnosticHelper;
 import com.github._1c_syntax.bsl.languageserver.utils.Trees;
 import com.github._1c_syntax.bsl.languageserver.utils.bsl.Constructors;
 import com.github._1c_syntax.bsl.parser.BSLParser;
@@ -40,6 +39,10 @@ public abstract class AbstractMagicValueDiagnostic extends AbstractVisitorDiagno
 
   private static final Pattern INSERT_METHOD_PATTERN = CaseInsensitivePattern.compile(
     "вставить|insert"
+  );
+
+  private static final Pattern DATE_METHOD_PATTERN = CaseInsensitivePattern.compile(
+    "Дата|Date"
   );
 
   private static final int MAX_PARENT_TRAVERSAL_DEPTH_FOR_CALL_STATEMENT = 10;
@@ -701,6 +704,27 @@ public abstract class AbstractMagicValueDiagnostic extends AbstractVisitorDiagno
    */
   protected static boolean insideReturnStatement(BSLParser.@Nullable ExpressionContext expression) {
     return insideContext(expression, BSLParser.ReturnStatementContext.class);
+  }
+
+  /**
+   * Возвращает вызов метода Дата(...)/Date(...), непосредственным аргументом которого
+   * является переданное выражение. Число аргументов не ограничивается: у Дата(...) их
+   * может быть от одного (строка-дата) до шести (год, месяц, день, час, минута, секунда).
+   *
+   * @param expression выражение-аргумент для проверки
+   * @return Optional с контекстом вызова Дата(...), если выражение — его аргумент, иначе empty
+   */
+  protected static Optional<BSLParser.GlobalMethodCallContext> getEnclosingDateMethodCall(
+    BSLParser.@Nullable ExpressionContext expression
+  ) {
+    return Optional.ofNullable(expression)
+      .map(ParserRuleContext::getParent) // callParam
+      .map(ParserRuleContext::getParent) // callParamList
+      .map(ParserRuleContext::getParent) // doCall
+      .map(ParserRuleContext::getParent) // globalCall - метод Дата(ХХХ)
+      .filter(BSLParser.GlobalMethodCallContext.class::isInstance)
+      .map(BSLParser.GlobalMethodCallContext.class::cast)
+      .filter(dateCall -> DATE_METHOD_PATTERN.matcher(dateCall.methodName().getText()).matches());
   }
 
   /**

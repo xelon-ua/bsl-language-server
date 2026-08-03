@@ -22,8 +22,9 @@
 package com.github._1c_syntax.bsl.languageserver.types.oscript;
 
 import com.github._1c_syntax.bsl.languageserver.context.ServerContext;
-import com.github._1c_syntax.bsl.languageserver.context.events.BeforeWorkspaceRemovedEvent;
+import com.github._1c_syntax.bsl.languageserver.events.BeforeWorkspaceRemovedEvent;
 import com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceContextHolder;
+import com.github._1c_syntax.bsl.languageserver.types.oscript.events.OScriptLibraryIndexedEvent;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
@@ -60,7 +61,7 @@ import static java.nio.file.StandardWatchEventKinds.ENTRY_MODIFY;
  * директории найденных манифестов (поскольку Java NIO не позволяет
  * регистрировать watch на отдельный файл — только на директорию),
  * polling через {@code @Scheduled(fixedDelay=5000)}, фильтр событий
- * по имени файла {@value LibConfigDiscovery#LIB_CONFIG_FILENAME}.
+ * по имени файла {@value DirContents#LIB_CONFIG_FILENAME}.
  * <p>
  * Подписывается на {@link OScriptLibraryIndexedEvent} после каждого reindex,
  * чтобы актуализировать набор отслеживаемых директорий: новые добавляет,
@@ -78,7 +79,7 @@ import static java.nio.file.StandardWatchEventKinds.ENTRY_MODIFY;
 @RequiredArgsConstructor
 public class OScriptLibraryFileSystemWatcher {
 
-  private static final String LIB_CONFIG_FILENAME = LibConfigDiscovery.LIB_CONFIG_FILENAME;
+  private static final String LIB_CONFIG_FILENAME = DirContents.LIB_CONFIG_FILENAME;
 
   @SuppressWarnings("NullAway.Init")
   private WatchService watchService;

@@ -22,13 +22,16 @@
 package com.github._1c_syntax.bsl.languageserver.semantictokens;
 
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
+import com.github._1c_syntax.bsl.languageserver.context.symbol.MethodSymbol;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.ParameterDefinition;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.VariableSymbol;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.variable.VariableKind;
 import com.github._1c_syntax.bsl.languageserver.references.ReferenceIndex;
 import com.github._1c_syntax.bsl.languageserver.references.model.OccurrenceType;
 import com.github._1c_syntax.bsl.languageserver.references.model.Reference;
-import com.github._1c_syntax.bsl.languageserver.utils.Modules;
+import com.github._1c_syntax.bsl.languageserver.context.Modules;
+import com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor;
+import com.github._1c_syntax.bsl.languageserver.types.symbol.PlatformMemberSymbol;
 import com.github._1c_syntax.bsl.languageserver.utils.Ranges;
 import lombok.RequiredArgsConstructor;
 import org.eclipse.lsp4j.SemanticTokenModifiers;
@@ -36,6 +39,7 @@ import org.eclipse.lsp4j.SemanticTokenTypes;
 import org.eclipse.lsp4j.SymbolKind;
 import org.springframework.stereotype.Component;
 
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -53,6 +57,20 @@ public class SymbolsSemanticTokensSupplier implements SemanticTokensSupplier {
     SemanticTokenModifiers.Static,
     SemanticTokenModifiers.Async
   };
+  private static final String[] DEFAULT_LIBRARY_MODIFIERS = {SemanticTokenModifiers.DefaultLibrary};
+  private static final String[] DEFAULT_LIBRARY_ASYNC_MODIFIERS = {
+    SemanticTokenModifiers.DefaultLibrary,
+    SemanticTokenModifiers.Async
+  };
+  private static final String[] DEFAULT_LIBRARY_STATIC_MODIFIERS = {
+    SemanticTokenModifiers.DefaultLibrary,
+    SemanticTokenModifiers.Static
+  };
+  private static final String[] DEFAULT_LIBRARY_STATIC_ASYNC_MODIFIERS = {
+    SemanticTokenModifiers.DefaultLibrary,
+    SemanticTokenModifiers.Static,
+    SemanticTokenModifiers.Async
+  };
 
   private final ReferenceIndex referenceIndex;
   private final SemanticTokensHelper helper;
@@ -66,7 +84,7 @@ public class SymbolsSemanticTokensSupplier implements SemanticTokensSupplier {
     // Add method symbols (functions and procedures)
     var isStatic = Modules.isStaticModule(documentContext);
     for (var method : symbolTree.getMethods()) {
-      var semanticTokenType = method.isFunction() ? SemanticTokenTypes.Function : SemanticTokenTypes.Method;
+      var semanticTokenType = methodTokenType(method);
       var modifiers = methodModifiers(isStatic, method.isAsync());
       helper.addRange(entries, method.getSubNameRange(), semanticTokenType, modifiers);
       for (ParameterDefinition parameter : method.getParameters()) {
@@ -104,7 +122,40 @@ public class SymbolsSemanticTokensSupplier implements SemanticTokensSupplier {
           }
         }));
 
+    // Неквалифицированные self-члены (реквизиты/платформенные методы self-типа модуля),
+    // проиндексированные ReferenceIndexFiller как обращения к PlatformMemberSymbol — красим
+    // здесь по индексу, тем же путём, что и обычные символы (отдельный сапплаер не нужен).
+    // Точечные члены (получатель.член) ведут PlatformMember*SemanticTokensSupplier'ы.
+    // Self-методы static-модуля (общий модуль/менеджер/.os-модуль) вызываются статически —
+    // тот же Static-модификатор, что и у объявленных методов такого модуля. Self-свойства
+    // Static не получают (как и объявленные переменные).
+    addSelfMemberTokens(entries, uri, SymbolKind.Property, SemanticTokenTypes.Property, false);
+    addSelfMemberTokens(entries, uri, SymbolKind.Method, SemanticTokenTypes.Method, isStatic);
+
     return entries;
+  }
+
+  private void addSelfMemberTokens(List<SemanticTokenEntry> entries, URI uri,
+                                   SymbolKind symbolKind, String tokenType, boolean isStatic) {
+    referenceIndex.getReferencesFrom(uri, symbolKind).stream()
+      .filter((Reference reference) -> reference.symbol() instanceof PlatformMemberSymbol)
+      .forEach((Reference reference) -> {
+        var descriptor = ((PlatformMemberSymbol) reference.symbol()).getDescriptor();
+        helper.addRange(entries, reference.selectionRange(), tokenType, selfMemberModifiers(descriptor, isStatic));
+      });
+  }
+
+  /**
+   * Тип семантического токена имени метода: {@link SemanticTokenTypes#Event} для обработчика
+   * платформенного события ({@link SymbolKind#Event}), иначе {@link SemanticTokenTypes#Method}.
+   * Объявленные в коде методы — и процедуры, и функции — семантически методы; {@link
+   * SemanticTokenTypes#Function} зарезервирован за платформенными глобальными функциями (их
+   * размечает отдельный supplier).
+   */
+  private static String methodTokenType(MethodSymbol method) {
+    return method.getSymbolKind() == SymbolKind.Event
+      ? SemanticTokenTypes.Event
+      : SemanticTokenTypes.Method;
   }
 
   private static String[] methodModifiers(boolean isStatic, boolean isAsync) {
@@ -112,6 +163,19 @@ public class SymbolsSemanticTokensSupplier implements SemanticTokensSupplier {
       return isAsync ? STATIC_ASYNC_MODIFIERS : STATIC_MODIFIERS;
     }
     return isAsync ? ASYNC_MODIFIERS : NO_MODIFIERS;
+  }
+
+  private static String[] selfMemberModifiers(MemberDescriptor descriptor, boolean isStatic) {
+    if (descriptor.standardLibrary()) {
+      if (isStatic) {
+        return descriptor.async() ? DEFAULT_LIBRARY_STATIC_ASYNC_MODIFIERS : DEFAULT_LIBRARY_STATIC_MODIFIERS;
+      }
+      return descriptor.async() ? DEFAULT_LIBRARY_ASYNC_MODIFIERS : DEFAULT_LIBRARY_MODIFIERS;
+    }
+    if (isStatic) {
+      return descriptor.async() ? STATIC_ASYNC_MODIFIERS : STATIC_MODIFIERS;
+    }
+    return descriptor.async() ? ASYNC_MODIFIERS : NO_MODIFIERS;
   }
 }
 

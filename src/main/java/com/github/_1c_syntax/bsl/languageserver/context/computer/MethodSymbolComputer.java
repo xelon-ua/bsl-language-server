@@ -22,7 +22,10 @@
 package com.github._1c_syntax.bsl.languageserver.context.computer;
 
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
+import com.github._1c_syntax.bsl.languageserver.context.FileType;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.ConstructorSymbol;
+import com.github._1c_syntax.bsl.languageserver.context.symbol.EventHandlerClassifier;
+import com.github._1c_syntax.bsl.languageserver.context.symbol.EventMethodSymbol;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.MethodSymbol;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.RegularMethodSymbol;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.ParameterDefinition;
@@ -69,10 +72,12 @@ public final class MethodSymbolComputer
     BSLParser.ANNOTATION_ATCLIENTATSERVER_SYMBOL);
 
   private final DocumentContext documentContext;
+  private final EventHandlerClassifier eventHandlerClassifier;
   private final Set<MethodSymbol> methods = new HashSet<>();
 
-  public MethodSymbolComputer(DocumentContext documentContext) {
+  public MethodSymbolComputer(DocumentContext documentContext, EventHandlerClassifier eventHandlerClassifier) {
     this.documentContext = documentContext;
+    this.eventHandlerClassifier = eventHandlerClassifier;
   }
 
   @Override
@@ -260,9 +265,33 @@ public final class MethodSymbolComputer
         .build();
     }
 
+    // Конструктор проверяется ДО события: "ПриСозданииОбъекта" у OScript-класса совпадает
+    // и с контрактом события (см. EventHandlerResolver.OSCRIPT_CLASS_EVENTS), но остаётся
+    // ConstructorSymbol — отдельный, уже устоявшийся вид символа со своей семантикой в дереве
+    // символов, hover'е и ReferenceIndex, реклассификации не подлежит. Классификация по имени
+    // не смотрит на function/procedure (как и lookupContract) — платформа вызывает обработчик
+    // по имени независимо от того, что метод по ошибке объявлен функцией.
+    if (eventHandlerClassifier.isEventHandler(documentContext, name)) {
+      return EventMethodSymbol.builder()
+        .name(name)
+        .owner(documentContext)
+        .range(range)
+        .subNameRange(subNameRange)
+        .function(function)
+        .export(export)
+        .async(async)
+        .description(description)
+        .deprecated(deprecated)
+        .parameters(parameters)
+        .compilerDirectiveKind(compilerDirective)
+        .annotations(annotations)
+        .build();
+    }
+
     return RegularMethodSymbol.builder()
       .name(name)
       .owner(documentContext)
+      .standaloneFunction(isStatelessModule())
       .range(range)
       .subNameRange(subNameRange)
       .function(function)
@@ -274,6 +303,29 @@ public final class MethodSymbolComputer
       .compilerDirectiveKind(compilerDirective)
       .annotations(annotations)
       .build();
+  }
+
+  /**
+   * Проверить, что модуль не хранит состояние: общий модуль BSL
+   * ({@link ModuleType#CommonModule}) либо модуль OneScript (любой {@code .os}-файл,
+   * не являющийся классом).
+   * <p>
+   * Методы таких модулей — самостоятельные функции, а не члены объекта со
+   * состоянием, поэтому для них корректнее {@link org.eclipse.lsp4j.SymbolKind#Function}.
+   * Класс OneScript ({@link ModuleType#OScriptClass}) — это инстанцируемый объект
+   * со своим состоянием, поэтому его методы остаются
+   * {@link org.eclipse.lsp4j.SymbolKind#Method}. Отдельный {@code .os}-файл вне
+   * библиотеки имеет {@link ModuleType#UNKNOWN}, но по семантике OneScript это
+   * скрипт-модуль, а не класс, поэтому он также считается модулем без состояния.
+   *
+   * @return {@code true}, если модуль не хранит состояние
+   */
+  private boolean isStatelessModule() {
+    if (documentContext.getModuleType() == ModuleType.CommonModule) {
+      return true;
+    }
+    return documentContext.getFileType() == FileType.OS
+      && documentContext.getModuleType() != ModuleType.OScriptClass;
   }
 
   /**
